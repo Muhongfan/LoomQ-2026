@@ -3,3 +3,5 @@
 # amazon-braket-sdk==<tested-version>
 # spinqit==<tested-version>
 # pyqpanda==<tested-version>
+spinqit==0.2.4
+amazon-braket-sdk==1.100.0
