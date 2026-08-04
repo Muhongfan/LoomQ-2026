@@ -3,5 +3,13 @@
 # amazon-braket-sdk==<tested-version>
 # spinqit==<tested-version>
 # pyqpanda==<tested-version>
+# spinqit hard-pins antlr4-python3-runtime==4.9.2 (its bundled QASM2 lexer
+# cannot deserialize grammars from newer antlr4 runtimes at all). Any
+# amazon-braket-sdk newer than ~1.99 needs a newer antlr4-python3-runtime
+# transitively via amazon-braket-default-simulator, and pip will silently
+# install a broken combination (import crashes) if these aren't pinned
+# explicitly together. See tools/gate_audit.py for the verification.
 spinqit==0.2.4
-amazon-braket-sdk==1.100.0
+antlr4-python3-runtime==4.9.2
+amazon-braket-sdk==1.99.0
+amazon-braket-default-simulator==1.27.0
