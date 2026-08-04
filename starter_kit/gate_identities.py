@@ -9,7 +9,10 @@ directly.
 import math
 from typing import List
 
-from .circuit_ir import GateOp
+try:
+    from .circuit_ir import GateOp
+except ImportError:
+    from circuit_ir import GateOp
 
 
 def decompose_s(gate: GateOp) -> List[GateOp]:
