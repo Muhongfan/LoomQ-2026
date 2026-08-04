@@ -21,7 +21,7 @@ from starter_kit.emitters import emit_braket, emit_originq, emit_spinq
 from starter_kit.evaluator import calculate_hellinger_fidelity
 
 CIRCUITS = Path(__file__).resolve().parents[1] / "starter_kit" / "circuits"
-BRAKET_STDLIB_DIR = Path(__file__).resolve().parents[1] / "tools" / "braket_local_stdlib"
+BRAKET_STDLIB_DIR = Path(__file__).resolve().parents[1] / "starter_kit" / "braket_local_stdlib"
 
 BELL_IDEAL = {"00": 0.5, "11": 0.5}
 GHZ3_IDEAL = {"000": 0.5, "111": 0.5}
