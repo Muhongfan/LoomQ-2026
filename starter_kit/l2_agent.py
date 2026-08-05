@@ -308,6 +308,13 @@ def _matching_backends(constraints: Dict[str, object], backends: List[Dict]) -> 
     return candidates
 
 
+_NO_FIT_ACKNOWLEDGED_RE = re.compile(
+    r"没有.*?(?:后端|平台).*?满足|无法(?:同时)?满足|不满足(?:全部|所有)?约束|无解|"
+    r"no\s+backend.*?satisf|doesn'?t\s+(?:fully\s+)?satisf|cannot\s+satisf",
+    re.IGNORECASE,
+)
+
+
 def _apply_backend_selection_safety_net(prompt: str, reply: str) -> str:
     constraints = _extract_backend_constraints(prompt)
     if not constraints:
@@ -327,6 +334,15 @@ def _apply_backend_selection_safety_net(prompt: str, reply: str) -> str:
             f"它满足你提出的约束条件（最多支持 {choice['max_qubits']} 比特，"
             f"排队情况：{choice['queue']}，费用：{choice['cost']}）。"
         )
+
+    if _NO_FIT_ACKNOWLEDGED_RE.search(reply):
+        # Empirically observed (real DeepSeek calls, not a hypothetical):
+        # the model can correctly conclude no backend fits and explain why
+        # in more detail than our own template -- only fall back to the
+        # generic honest-answer template when it hasn't already said this,
+        # rather than unconditionally discarding a correct, more useful
+        # explanation.
+        return reply
 
     largest = max(backends, key=lambda b: b["max_qubits"])
     return (

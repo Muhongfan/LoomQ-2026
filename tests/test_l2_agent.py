@@ -366,6 +366,47 @@ class BackendSelectionSafetyNetTests(unittest.TestCase):
         self.assertIn("没有任何后端", result)
         self.assertIn("originq_wukong", result)  # largest max_qubits (72) in the table
 
+    def test_llm_already_honest_about_no_fit_is_kept_unchanged(self):
+        # Captured verbatim from a real DeepSeek call during Phase 5 testing:
+        # the model correctly concluded no backend fits and explained why in
+        # more detail than our own template -- must not be discarded.
+        reply = (
+            "[TASK: select_backend]\n\n根据后端能力表，没有任何后端支持 100 比特的真机运行"
+            "——表中最大的真机是本源悟空（72 比特），且它是唯一支持超过 8 比特的真机。"
+            "因此没有后端能满足“100 比特 + 真机”这一组合约束。\n\n"
+            "最接近的替代方案是 **`originq_wukong`**（本源悟空超导真机，72 比特），"
+            "它是当前唯一能承载大规模电路的真机，但最大仅 72 比特。"
+        )
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我要在真机上跑一个 100 比特的电路", reply
+        )
+        self.assertEqual(result, reply)
+
+    def test_llm_already_honest_about_conflicting_constraints_is_kept_unchanged(self):
+        # Also captured verbatim: a genuinely conflicting constraint set
+        # (originq_wukong meets qubit count + real hardware + free quota,
+        # but its queue is "hours", not "none").
+        reply = (
+            "[TASK: select_backend]\n\n根据后端能力表，**没有任何后端能同时满足"
+            "“不排队 + 免费 + 真机 + 72 比特”**这四个约束：\n\n"
+            "- 真机中比特数达到 72 的只有 `originq_wukong`（本源悟空），但它**排队数小时**，且需要注册账号。\n"
+            "- 其他真机（`spinq_cloud_qpu`）比特数只有 8，不满足 72 比特。\n"
+            "- 免费且不排队的都是**模拟器**"
+        )
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我要一个不排队、免费、还要在真机上跑的 72 比特电路", reply
+        )
+        self.assertEqual(result, reply)
+
+    def test_dishonest_no_id_reply_still_gets_the_template_fallback(self):
+        # No acknowledgement of "no fit" at all -- must still fall back to
+        # the honest template rather than silently returning something vague.
+        reply = "可以试试某个后端。"
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我要在真机上跑一个 100 比特的电路", reply
+        )
+        self.assertIn("没有任何后端", result)
+
     def test_ambiguous_prompt_trusts_llm_reply_unchanged(self):
         reply = "随便一个都行。"
         result = l2_agent._apply_backend_selection_safety_net("你好，能帮帮我吗？", reply)
