@@ -1,6 +1,9 @@
 """L1 gate-whitelist and structural validation for parsed Circuit IR."""
 
-from .circuit_ir import Circuit
+try:
+    from .circuit_ir import Circuit
+except ImportError:
+    from circuit_ir import Circuit
 
 # (n_qubits, n_params) per problem_statement.md's 12-gate whitelist.
 GATE_ARITY = {
