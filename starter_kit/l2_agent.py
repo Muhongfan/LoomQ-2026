@@ -112,7 +112,9 @@ def _uniform_ideal(n: int) -> Dict[str, float]:
     return {format(i, f"0{n}b"): 1.0 / size for i in range(size)}
 
 
-_TARGET_TAG_RE = re.compile(r"\[TARGET:\s*(ghz|bell|uniform|basis:[01]+|other)\]", re.IGNORECASE)
+_TARGET_TAG_RE = re.compile(
+    r"\[TARGET:\s*(ghz|bell|uniform|basis:[01]+|prob:\d+:[01]?\.\d+|other)\]", re.IGNORECASE
+)
 
 
 def _classify_target_tag(reply: str) -> Optional[str]:
@@ -123,6 +125,32 @@ def _classify_target_tag(reply: str) -> Optional[str]:
     classification is more robust than our own keyword matching."""
     match = _TARGET_TAG_RE.search(reply)
     return match.group(1).lower() if match else None
+
+
+_PROB_TAG_DETAIL_RE = re.compile(r"^prob:(\d+):([01]?\.\d+)$", re.IGNORECASE)
+
+
+def _parse_probability_tag(tag: str) -> Optional[Tuple[int, float]]:
+    """Parses a "prob:<qubit>:<probability>" tag value, e.g. "prob:0:0.3"
+    means the model is targeting P(qubit 0 == 1) == 0.3."""
+    match = _PROB_TAG_DETAIL_RE.match(tag)
+    if not match:
+        return None
+    return int(match.group(1)), float(match.group(2))
+
+
+_PROBABILITY_TOLERANCE = 0.03
+
+
+def _marginal_probability(raw_counts: Dict[str, int], qubit_index: int) -> float:
+    """Spinqit's raw counts place qubit i's value at string position i for a
+    standard full-register `measure q -> c;` broadcast (confirmed during L1
+    Phase 5's bit-order investigation), so a direct character lookup gives
+    the correct marginal without needing the contract-level bit-order fix
+    runner.py applies for graded results."""
+    total = sum(raw_counts.values())
+    ones = sum(count for bits, count in raw_counts.items() if bits[qubit_index] == "1")
+    return ones / total
 
 
 def _infer_ideal_distribution_from_prompt(
@@ -149,6 +177,27 @@ def _infer_ideal_distribution_from_prompt(
     if basis_match and len(basis_match.group(1)) == n_clbits:
         return {basis_match.group(1): 1.0}, "basis"
     return None, None
+
+
+_FAMILY_KEYWORD_GROUPS = (
+    re.compile(r"ghz|最大纠缠|贝尔|bell", re.IGNORECASE),
+    re.compile(r"uniform superposition|均匀叠加", re.IGNORECASE),
+    re.compile(r"[|｜][01]+[⟩>》]"),
+)
+
+
+def _mentions_multiple_families(prompt: str) -> bool:
+    """A prompt naming more than one recognized family in the same request
+    (e.g. "front two qubits Bell, back two qubits uniform superposition")
+    describes a COMPOSITE state that applying any single family's whole-
+    circuit distribution cannot correctly verify. Found via real testing
+    (Phase 5): doing so anyway doesn't just fail to verify -- it actively
+    misjudges a correct first answer as wrong and pushes the retry toward a
+    different, incorrect "corrected" circuit the user never asked for. This
+    check is a cheap way to avoid causing that harm; it does not attempt to
+    actually verify composite targets correctly (see ROADMAP.md for why
+    that's a much bigger undertaking, out of scope for now)."""
+    return sum(1 for pattern in _FAMILY_KEYWORD_GROUPS if pattern.search(prompt)) >= 2
 
 
 def _recognize_target(
@@ -230,6 +279,43 @@ def _verify_generated_circuit(prompt: str, reply: str, qasm: str) -> Tuple[bool,
         validate_circuit(circuit)
     except ValueError as exc:
         return False, f"电路解析或校验失败：{exc}"
+
+    # Precise single-qubit measurement probability (e.g. "P(q0=1) should be
+    # exactly 30%") is checked separately from the named-family distribution
+    # comparison below: it's a marginal-probability check, not a full-state
+    # fidelity comparison, since other qubits may be present and unconstrained.
+    # Found via real testing (Phase 5): a model can state the correct formula
+    # in its explanation while plugging in a swapped/wrong number into the
+    # actual gate parameter -- that mismatch was previously undetectable
+    # because this request shape didn't match any recognized family.
+    prob_tag = _classify_target_tag(reply)
+    prob_target = _parse_probability_tag(prob_tag) if prob_tag else None
+    if prob_target is not None:
+        qubit_index, target_prob = prob_target
+        if not (0 <= qubit_index < circuit.n_qubits):
+            return False, f"[TARGET: prob:{qubit_index}:{target_prob}] 引用的比特超出了电路声明的 {circuit.n_qubits} 个量子比特"
+        try:
+            raw_counts = _execute_via_spinqit(qasm, shots=4096)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"电路无法在模拟器上执行：{type(exc).__name__}: {exc}"
+        observed_prob = _marginal_probability(raw_counts, qubit_index)
+        if abs(observed_prob - target_prob) > _PROBABILITY_TOLERANCE:
+            return False, (
+                f"目标要求 q[{qubit_index}] 测到 1 的概率约为 {target_prob:.1%}，"
+                f"但电路实际测得约 {observed_prob:.1%}。请检查旋转角度计算是否正确"
+                f"（ry(θ) 使 P(1)=sin²(θ/2)，θ = 2·arcsin(√p)）。"
+            )
+        return True, ""
+
+    if _mentions_multiple_families(prompt):
+        # Composite/compound target (see _mentions_multiple_families) --
+        # deliberately skip the single-family fidelity check rather than
+        # misapply one family's whole-circuit distribution to a request
+        # that actually describes several independent parts.
+        structural_issue = _structural_sanity_check(prompt, circuit)
+        if structural_issue:
+            return False, structural_issue
+        return True, ""
 
     ideal, family = _recognize_target(prompt, reply, circuit.n_clbits)
     if ideal is None:
@@ -386,6 +472,8 @@ SYSTEM_PROMPT = """你是 LoomQ 平台的智能体，帮助不熟悉量子计算
 [TARGET: ghz]          GHZ 态或贝尔态（多比特最大纠缠态，全 0/全 1 各占一半概率）
 [TARGET: uniform]      均匀叠加态（每个比特独立做 Hadamard，所有基态等概率）
 [TARGET: basis:101]    制备一个确定的计算基态，冒号后是具体的比特串
+[TARGET: prob:0:0.3]   用户要求某个比特测量为 1 的概率恰好是某个数值，冒号后依次是
+                       比特编号（从 0 开始）和目标概率（0 到 1 之间的小数）
 [TARGET: other]        以上都不是
 ```
 

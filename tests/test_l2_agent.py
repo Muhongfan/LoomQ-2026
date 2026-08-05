@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import threading
 import time
@@ -578,9 +579,60 @@ class TargetTagClassificationTests(unittest.TestCase):
         self.assertEqual(l2_agent._classify_target_tag("[TARGET: uniform]\n..."), "uniform")
         self.assertEqual(l2_agent._classify_target_tag("[TARGET: basis:101]\n..."), "basis:101")
         self.assertEqual(l2_agent._classify_target_tag("[TARGET: other]\n..."), "other")
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: prob:0:0.3]\n..."), "prob:0:0.3")
 
     def test_missing_tag_returns_none(self):
         self.assertIsNone(l2_agent._classify_target_tag("没有任何标记的回复"))
+
+
+class ProbabilityTagParsingTests(unittest.TestCase):
+    def test_parses_qubit_and_probability(self):
+        self.assertEqual(l2_agent._parse_probability_tag("prob:0:0.3"), (0, 0.3))
+        self.assertEqual(l2_agent._parse_probability_tag("prob:2:0.75"), (2, 0.75))
+
+    def test_non_probability_tag_returns_none(self):
+        self.assertIsNone(l2_agent._parse_probability_tag("ghz"))
+        self.assertIsNone(l2_agent._parse_probability_tag("other"))
+
+
+# Real bug found during Phase 5 testing: for "let qubit 0 have P(1) = 30%",
+# a real DeepSeek reply stated the correct formula (theta = 2*arccos(sqrt(0.7)))
+# in its explanation, but plugged in ry(1.9823) -- the value for 2*arccos(sqrt(0.3))
+# instead, actually producing P(1) ~= 70%. This request shape matched no
+# recognized family before [TARGET: prob:...] existed, so verification
+# silently passed a circuit that measurably did not do what was asked.
+_CORRECT_THETA_FOR_30_PERCENT = 2 * math.asin(math.sqrt(0.3))
+
+
+class ProbabilityTargetVerificationTests(unittest.TestCase):
+    def _qasm(self, theta: float) -> str:
+        return (
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[1];\ncreg c[1];\n'
+            f"ry({theta!r}) q[0];\nmeasure q -> c;\n"
+        )
+
+    def test_correct_angle_passes(self):
+        qasm = self._qasm(_CORRECT_THETA_FOR_30_PERCENT)
+        reply = "[TASK: generate]\n[TARGET: prob:0:0.3]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit("...", reply, qasm)
+        self.assertTrue(ok, feedback)
+
+    def test_swapped_angle_from_the_real_bug_is_caught(self):
+        # This is the exact wrong value (ry(1.9823)) captured from the real
+        # DeepSeek reply -- must now fail instead of silently passing.
+        qasm = self._qasm(1.9823)
+        reply = "[TASK: generate]\n[TARGET: prob:0:0.3]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit("...", reply, qasm)
+        self.assertFalse(ok)
+        self.assertIn("30.0%", feedback)
+        self.assertIn("70", feedback)  # observed probability is ~70%
+
+    def test_qubit_index_out_of_range_is_rejected(self):
+        qasm = self._qasm(_CORRECT_THETA_FOR_30_PERCENT)
+        reply = "[TASK: generate]\n[TARGET: prob:5:0.3]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit("...", reply, qasm)
+        self.assertFalse(ok)
+        self.assertIn("超出", feedback)
 
 
 class TargetRecognitionTests(unittest.TestCase):
@@ -609,6 +661,53 @@ class TargetRecognitionTests(unittest.TestCase):
         ideal, family = l2_agent._recognize_target("生成一个贝尔态", "没有标记的回复", n_clbits=2)
         self.assertEqual(family, "ghz")
         self.assertEqual(ideal, {"00": 0.5, "11": 0.5})
+
+
+class MultipleFamilyDetectionTests(unittest.TestCase):
+    def test_single_family_mention_is_not_flagged(self):
+        self.assertFalse(l2_agent._mentions_multiple_families("生成一个 3 比特的最大纠缠态 (GHZ 态)"))
+        self.assertFalse(l2_agent._mentions_multiple_families("我想制备一个贝尔态"))
+        self.assertFalse(l2_agent._mentions_multiple_families("做一个均匀叠加态"))
+
+    def test_composite_description_is_flagged(self):
+        prompt = "生成一个4比特电路：前两个比特纠缠成贝尔态，后两个比特各自做均匀叠加，两部分互不干扰"
+        self.assertTrue(l2_agent._mentions_multiple_families(prompt))
+
+    def test_unrelated_prompt_is_not_flagged(self):
+        self.assertFalse(l2_agent._mentions_multiple_families("生成一个随便的电路"))
+
+
+# The exact real scenario from Phase 5: this circuit (front pair entangled,
+# back two qubits independently in superposition) correctly matches the
+# user's composite request. Before _mentions_multiple_families existed,
+# _verify_generated_circuit misjudged it against a whole-circuit GHZ-4
+# distribution and rejected it, forcing a retry that "corrected" a right
+# answer into a different, fully-entangled circuit the user never asked for.
+COMPOSITE_PROMPT = "生成一个4比特电路：前两个比特纠缠成贝尔态，后两个比特各自做均匀叠加，两部分互不干扰，然后测量全部"
+CORRECT_COMPOSITE_QASM = (
+    'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[4];\ncreg c[4];\n'
+    "h q[0];\ncx q[0],q[1];\nh q[2];\nh q[3];\nmeasure q -> c;\n"
+)
+
+
+class CompositeTargetMitigationTests(unittest.TestCase):
+    def test_correct_composite_circuit_is_no_longer_wrongly_rejected(self):
+        reply = f"[TASK: generate]\n[TARGET: ghz]\n...\n```\n{CORRECT_COMPOSITE_QASM}```\n"
+        ok, feedback = l2_agent._verify_generated_circuit(COMPOSITE_PROMPT, reply, CORRECT_COMPOSITE_QASM)
+        self.assertTrue(ok, feedback)
+
+    def test_structural_checks_still_apply_to_composite_prompts(self):
+        # Even when skipping the single-family fidelity check, a genuinely
+        # broken circuit (no entangling gate despite "纠缠" in the prompt)
+        # must still be caught.
+        broken_qasm = (
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[4];\ncreg c[4];\n'
+            "h q[0];\nh q[1];\nh q[2];\nh q[3];\nmeasure q -> c;\n"
+        )
+        reply = "[TASK: generate]\n[TARGET: ghz]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit(COMPOSITE_PROMPT, reply, broken_qasm)
+        self.assertFalse(ok)
+        self.assertIn("纠缠", feedback)
 
 
 class StructuralSanityCheckTests(unittest.TestCase):
