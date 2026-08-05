@@ -122,6 +122,44 @@ class GenerationRoundTripTests(MockLLMServerTestCase):
         validate_circuit(circuit)  # must not raise
 
 
+# Captured verbatim from a real DeepSeek call during Phase 5 testing, after
+# adding the mixed-task instruction to SYSTEM_PROMPT: given "generate a
+# 3-qubit GHZ state, and tell me which backend to run it on with zero
+# queue", the model used to silently drop the backend-selection half of the
+# request entirely. It now answers the primary (generation) task in full
+# and explicitly tells the user to ask the backend question separately,
+# instead of silently ignoring it.
+MIXED_TASK_ACKNOWLEDGMENT_REPLY = """[TASK: generate]
+[TARGET: ghz]
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+cx q[0],q[1];
+cx q[0],q[2];
+measure q -> c;
+```
+
+我生成了 3 比特 GHZ 态：先对 q[0] 做 Hadamard 得到叠加态，再通过两个 CNOT 门将纠缠扩展到 q[1] 和 q[2]，最终得到 (|000⟩ + |111⟩)/√2。
+
+你的问题里还包含选后端请求，请单独再问一次，我可以专门回答。
+"""
+
+
+class MixedTaskAcknowledgmentTests(MockLLMServerTestCase):
+    def test_generation_half_still_verifies_and_acknowledgment_is_preserved(self):
+        ScriptedAPIHandler.reply_content = MIXED_TASK_ACKNOWLEDGMENT_REPLY
+        reply = l2_agent.agent_chat("生成一个 3 比特 GHZ 态，并告诉我用哪个后端跑最好，要求零排队")
+
+        # verified correctly (single call, not retried) and the
+        # acknowledgment text wasn't stripped by any downstream processing.
+        self.assertEqual(l2_agent.extract_qasm(reply), l2_agent.extract_qasm(MIXED_TASK_ACKNOWLEDGMENT_REPLY))
+        self.assertIn("请单独再问一次", reply)
+
+
 class MissingEnvironmentTests(unittest.TestCase):
     def test_missing_environment_raises_and_does_not_fall_back_to_mock_data(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -428,6 +466,7 @@ class TaskTagClassificationTests(unittest.TestCase):
         self.assertEqual(l2_agent._classify_task_tag("[TASK: generate]\n..."), "generate")
         self.assertEqual(l2_agent._classify_task_tag("[TASK: fix]\n..."), "fix")
         self.assertEqual(l2_agent._classify_task_tag("[TASK: select_backend]\n..."), "select_backend")
+        self.assertEqual(l2_agent._classify_task_tag("[TASK: clarify]\n..."), "clarify")
 
     def test_case_and_leading_whitespace_insensitive(self):
         self.assertEqual(l2_agent._classify_task_tag("  [task: GENERATE]\nfoo"), "generate")
@@ -481,8 +520,28 @@ measure q -> c;
 
 GENERATE_MISSING_CODE_BLOCK = "[TASK: generate]\n好的，我需要制备一个 3 比特 GHZ 态。"
 
+# Captured (paraphrased) from a real DeepSeek call during Phase 5 testing:
+# given pure nonsense input ("asdkjaslkdj 请帮我弄一个 qwerty 谢谢"), the model
+# reasonably refused to fabricate a circuit and asked for clarification --
+# before [TASK: clarify] existed, this was misrouted into the generate/fix
+# branch (no QASM found -> "bad format" -> retry), burning 3 real API calls
+# on a request that was never going to produce a circuit.
+CLARIFICATION_NEEDED_REPLY = """[TASK: clarify]
+
+我理解你想要一些帮助，但你的消息中没有提供任何具体的电路代码或目标态描述。
+我无法凭空生成或修复一段不存在的代码。请说明你的目标态（例如 GHZ、均匀叠加，
+或某个基态），或者贴出需要修复的 OpenQASM 代码。
+"""
+
 
 class TaskTagRoutingTests(SequencedMockLLMServerTestCase):
+    def test_clarify_tag_returns_immediately_without_retry(self):
+        SequencedAPIHandler.reply_sequence = [CLARIFICATION_NEEDED_REPLY]
+        reply = l2_agent.agent_chat("asdkjaslkdj 请帮我弄一个 qwerty 谢谢")
+
+        self.assertEqual(SequencedAPIHandler.call_count, 1)  # no wasted retries
+        self.assertEqual(reply, CLARIFICATION_NEEDED_REPLY)
+
     def test_backend_selection_reply_with_embedded_code_is_not_misread_as_generation(self):
         # Without the tag, extract_qasm would find the embedded snippet and
         # misroute this into circuit verification instead of the backend

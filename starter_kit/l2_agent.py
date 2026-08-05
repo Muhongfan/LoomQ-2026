@@ -24,7 +24,7 @@ except ImportError:
     from validator import validate_circuit
 
 _QASM_RE = re.compile(r"OPENQASM\s+2\.0;.*?(?=^\s*```|\Z)", re.DOTALL | re.MULTILINE)
-_TASK_TAG_RE = re.compile(r"^\s*\[TASK:\s*(generate|fix|select_backend)\]", re.IGNORECASE)
+_TASK_TAG_RE = re.compile(r"^\s*\[TASK:\s*(generate|fix|select_backend|clarify)\]", re.IGNORECASE)
 
 
 def _classify_task_tag(reply: str) -> Optional[str]:
@@ -355,14 +355,25 @@ def _apply_backend_selection_safety_net(prompt: str, reply: str) -> str:
 
 SYSTEM_PROMPT = """你是 LoomQ 平台的智能体，帮助不熟悉量子计算的用户使用量子计算机。
 
-用户的请求属于以下三类之一。**你的回复必须以下面三个标记之一开头，独占一行**，
+用户的请求属于以下四类之一。**你的回复必须以下面四个标记之一开头，独占一行**，
 帮助下游程序判断你识别出的任务类型（这不是给用户看的内容，只是一个路由标记）：
 
 ```
 [TASK: generate]
 [TASK: fix]
 [TASK: select_backend]
+[TASK: clarify]
 ```
+
+**如果用户的一句话里同时包含了多种任务**（比如既要生成电路，又问该用哪个后端），
+只能标记并完整回答其中最主要的一个（生成/修复电路优先于选后端），但**不要静默
+忽略**另一部分请求——在正文末尾另起一段，明确说明"你的问题里还包含 XX 请求，
+请单独再问一次，我可以专门回答"。
+
+**如果用户的请求信息不足以生成或修复任何电路**（比如内容完全无关、没有提供要
+修复的代码、也没有说明任何目标态），请使用 `[TASK: clarify]`，用一两句话说明
+还需要用户补充什么信息，**不要**尝试勉强输出一个代码块，也不要因为找不到代码块
+而反复重试——这种情况下你的判断就是最终答案。
 
 标记之后，请根据内容按对应格式回复：
 
@@ -481,6 +492,15 @@ def agent_chat(prompt: str) -> str:
         # valid backend-selection reply instead of a failed attempt to fix).
         if task == "select_backend":
             return _apply_backend_selection_safety_net(prompt, reply)
+
+        if task == "clarify":
+            # The model has judged there isn't enough information to
+            # generate/fix anything -- that judgment is the final answer.
+            # Treating a missing QASM block here as "bad format, retry" (as
+            # the generate/fix branch below does) would waste attempts
+            # forcing the model to produce a circuit it has already said it
+            # can't responsibly produce.
+            return reply
 
         if task in ("generate", "fix"):
             if qasm is None:
