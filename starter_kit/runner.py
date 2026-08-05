@@ -29,10 +29,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-from .circuit_ir import Circuit
-from .emitters import _is_full_identity_measurement, emit_braket, emit_originq, emit_spinq
-from .lowering import lower
-from .validator import validate_circuit
+try:
+    from .circuit_ir import Circuit
+    from .emitters import _is_full_identity_measurement, emit_braket, emit_originq, emit_spinq
+    from .lowering import lower
+    from .validator import validate_circuit
+except ImportError:
+    from circuit_ir import Circuit
+    from emitters import _is_full_identity_measurement, emit_braket, emit_originq, emit_spinq
+    from lowering import lower
+    from validator import validate_circuit
 
 REPO_ROOT = Path(__file__).resolve().parent
 BRAKET_STDLIB_DIR = REPO_ROOT / "braket_local_stdlib"

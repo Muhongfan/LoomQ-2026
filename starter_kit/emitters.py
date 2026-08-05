@@ -6,7 +6,10 @@ of run()'s counts. Each emitter assumes its input Circuit already passed
 validator.validate_circuit() and lowering.lower() for its target.
 """
 
-from .circuit_ir import Circuit
+try:
+    from .circuit_ir import Circuit
+except ImportError:
+    from circuit_ir import Circuit
 
 # cu1 has no name in the official OpenQASM3 stdgates.inc (only a controlled-
 # phase under a different name depending on interpreter). Rather than rely on
