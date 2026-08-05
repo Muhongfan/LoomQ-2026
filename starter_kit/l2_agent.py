@@ -24,6 +24,38 @@ except ImportError:
     from validator import validate_circuit
 
 _QASM_RE = re.compile(r"OPENQASM\s+2\.0;.*?(?=^\s*```|\Z)", re.DOTALL | re.MULTILINE)
+_TASK_TAG_RE = re.compile(r"^\s*\[TASK:\s*(generate|fix|select_backend)\]", re.IGNORECASE)
+
+
+def _classify_task_tag(reply: str) -> Optional[str]:
+    """Reads the explicit [TASK: ...] tag the SYSTEM_PROMPT requires as the
+    first line of every reply. Returns None if the model didn't include a
+    recognizable tag (older/malformed replies) — callers should fall back
+    to inferring from content in that case, not treat it as an error, since
+    a model occasionally not following the tag instruction shouldn't break
+    the whole turn."""
+    match = _TASK_TAG_RE.match(reply)
+    return match.group(1).lower() if match else None
+
+
+def _extract_reply_content(response: Dict) -> str:
+    """Defensive parsing of the chat-completion response shape. Without
+    this, a malformed/unexpected response (empty choices from a content
+    filter, a provider returning a different shape, etc.) surfaces as a
+    bare IndexError/KeyError deep in agent_chat with no indication of what
+    actually went wrong."""
+    if not isinstance(response, dict):
+        raise RuntimeError(f"LLM response was not a JSON object: {type(response).__name__}")
+    choices = response.get("choices")
+    if not choices:
+        raise RuntimeError(f"LLM response contained no choices: {response!r}")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message, dict) or "content" not in message:
+        raise RuntimeError(f"LLM response choice has no message content: {choices[0]!r}")
+    content = message["content"]
+    if not isinstance(content, str):
+        raise RuntimeError(f"LLM response content was not a string: {type(content).__name__}")
+    return content
 
 
 def extract_qasm(text: str) -> Optional[str]:
@@ -80,42 +112,131 @@ def _uniform_ideal(n: int) -> Dict[str, float]:
     return {format(i, f"0{n}b"): 1.0 / size for i in range(size)}
 
 
-def _infer_ideal_distribution(prompt: str, n_clbits: int) -> Optional[Dict[str, float]]:
-    """Recognizes a bounded set of nameable target-state families from the
-    ORIGINAL user prompt (not the generated circuit) — deliberately narrow:
-    Bell/GHZ-n, uniform superposition-n, and an explicit computational basis
-    state like "|101>". QFT-n/Grover-n are excluded on purpose: QFT measured
-    right after only a forward transform is always uniform regardless of
-    whether cu1's phases are correct (a structural DFT property, see
-    ROADMAP.md Phase 7), and Grover's ideal distribution depends on the
-    marked state and iteration count, not something inferable from a
-    one-line prompt. Circuits we can't recognize a family for still get
-    syntax/whitelist validation — this is an honest capability boundary,
-    not a shortcut.
+_TARGET_TAG_RE = re.compile(r"\[TARGET:\s*(ghz|bell|uniform|basis:[01]+|other)\]", re.IGNORECASE)
+
+
+def _classify_target_tag(reply: str) -> Optional[str]:
+    """Reads the model's own [TARGET: ...] self-report (required by
+    SYSTEM_PROMPT for generate/fix replies). Preferred over regexing the
+    raw prompt: the model has already done the natural-language work of
+    understanding a possibly reworded request, so trusting its own
+    classification is more robust than our own keyword matching."""
+    match = _TARGET_TAG_RE.search(reply)
+    return match.group(1).lower() if match else None
+
+
+def _infer_ideal_distribution_from_prompt(
+    prompt: str, n_clbits: int
+) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    """Fallback for when the model didn't include a [TARGET: ...] tag
+    (older/malformed replies) — regexes the ORIGINAL user prompt instead.
+    Deliberately narrow: Bell/GHZ-n, uniform superposition-n, and an
+    explicit computational basis state like "|101>". QFT-n/Grover-n are
+    excluded on purpose: QFT measured right after only a forward transform
+    is always uniform regardless of whether cu1's phases are correct (a
+    structural DFT property, see ROADMAP.md Phase 7), and Grover's ideal
+    distribution depends on the marked state and iteration count, not
+    something inferable from a one-line prompt.
     """
     lowered = prompt.lower()
     if "ghz" in lowered or "最大纠缠" in prompt or "GHZ" in prompt:
-        return _ghz_ideal(n_clbits)
+        return _ghz_ideal(n_clbits), "ghz"
     if "bell" in lowered or "贝尔" in prompt:
-        return _ghz_ideal(n_clbits)
+        return _ghz_ideal(n_clbits), "ghz"
     if "uniform superposition" in lowered or "均匀叠加" in prompt:
-        return _uniform_ideal(n_clbits)
+        return _uniform_ideal(n_clbits), "uniform"
     basis_match = re.search(r"[|｜]([01]+)[⟩>》]", prompt)
     if basis_match and len(basis_match.group(1)) == n_clbits:
-        return {basis_match.group(1): 1.0}
+        return {basis_match.group(1): 1.0}, "basis"
+    return None, None
+
+
+def _recognize_target(
+    prompt: str, reply: str, n_clbits: int
+) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+    """Returns (ideal_distribution, family_label) if a target family the
+    self-verifier knows how to compute a closed-form distribution for is
+    recognized, else (None, None). Circuits we can't recognize a family for
+    still get syntax/whitelist validation plus the structural sanity checks
+    in _structural_sanity_check — an honest capability boundary, not a
+    silent pass-through."""
+    tag = _classify_target_tag(reply)
+    if tag and tag != "other":
+        if tag in ("ghz", "bell"):
+            return _ghz_ideal(n_clbits), "ghz"
+        if tag == "uniform":
+            return _uniform_ideal(n_clbits), "uniform"
+        if tag.startswith("basis:"):
+            bits = tag.split(":", 1)[1]
+            if len(bits) == n_clbits:
+                return {bits: 1.0}, "basis"
+        # tag present but doesn't line up with the circuit's actual clbit
+        # count (e.g. basis:101 tagged on a 2-clbit circuit) -- fall through
+        # to the prompt-based fallback rather than silently trusting a tag
+        # that can't possibly be right.
+    return _infer_ideal_distribution_from_prompt(prompt, n_clbits)
+
+
+_ENTANGLING_GATES = frozenset({"cx", "cu1", "swap", "ccx"})
+
+
+def _structural_sanity_check(prompt: str, circuit: Circuit) -> Optional[str]:
+    """Cheap checks that don't require knowing the exact ideal distribution
+    — catch obvious mismatches instead of silently passing anything
+    syntactically valid when the target family isn't one we can compute a
+    closed-form distribution for."""
+    qubit_match = _QUBIT_COUNT_RE.search(prompt)
+    if qubit_match:
+        stated = int(qubit_match.group(1) or qubit_match.group(2))
+        if circuit.n_qubits != stated:
+            return f"你要求 {stated} 个比特，但电路声明了 {circuit.n_qubits} 个量子比特"
+
+    if re.search(r"纠缠|entangle", prompt, re.IGNORECASE):
+        if not any(gate.name in _ENTANGLING_GATES for gate in circuit.gates):
+            return "描述中提到了纠缠，但电路里没有任何两比特门（cx/cu1/swap/ccx），无法产生纠缠"
+
     return None
 
 
-def _verify_generated_circuit(prompt: str, qasm: str) -> Tuple[bool, str]:
+_FAMILY_HINTS = {
+    "ghz": "请检查是否漏加了纠缠门（如 cx），或纠缠链是否覆盖了全部比特。",
+    "uniform": "请检查是否给每一个比特都加上了 h 门。",
+    "basis": "请检查每个比特是否用 x 门正确翻转到了目标值。",
+}
+
+
+def _format_distribution(distribution: Dict[str, float], limit: int = 6) -> str:
+    ordered = sorted(distribution.items(), key=lambda kv: -kv[1])[:limit]
+    parts = [f"{key}: {value:.1%}" for key, value in ordered]
+    suffix = ", ..." if len(distribution) > limit else ""
+    return "{" + ", ".join(parts) + suffix + "}"
+
+
+def _fidelity_failure_feedback(
+    family: Optional[str], observed: Dict[str, float], ideal: Dict[str, float], fidelity: float
+) -> str:
+    hint = _FAMILY_HINTS.get(family, "")
+    return (
+        f"保真度不足（{fidelity:.3f} < 0.97）。"
+        f"你的电路实际测量分布约为 {_format_distribution(observed)}，"
+        f"但目标分布应为 {_format_distribution(ideal)}。"
+        f"{hint}"
+    )
+
+
+def _verify_generated_circuit(prompt: str, reply: str, qasm: str) -> Tuple[bool, str]:
     try:
         circuit = parse_qasm2(qasm)
         validate_circuit(circuit)
     except ValueError as exc:
         return False, f"电路解析或校验失败：{exc}"
 
-    ideal = _infer_ideal_distribution(prompt, circuit.n_clbits)
+    ideal, family = _recognize_target(prompt, reply, circuit.n_clbits)
     if ideal is None:
-        return True, ""  # can't infer a target family; syntax validity is all we can check
+        structural_issue = _structural_sanity_check(prompt, circuit)
+        if structural_issue:
+            return False, structural_issue
+        return True, ""  # can't infer an exact target family; structural checks passed
 
     try:
         raw_counts = _execute_via_spinqit(qasm, shots=2048)
@@ -126,7 +247,7 @@ def _verify_generated_circuit(prompt: str, qasm: str) -> Tuple[bool, str]:
     observed = {key: value / total for key, value in raw_counts.items()}
     fidelity = _hellinger_fidelity(observed, ideal)
     if fidelity < 0.97:
-        return False, f"保真度不足（{fidelity:.3f} < 0.97），电路未能实现目标态"
+        return False, _fidelity_failure_feedback(family, observed, ideal, fidelity)
     return True, ""
 
 
@@ -218,10 +339,29 @@ def _apply_backend_selection_safety_net(prompt: str, reply: str) -> str:
 
 SYSTEM_PROMPT = """你是 LoomQ 平台的智能体，帮助不熟悉量子计算的用户使用量子计算机。
 
-用户的请求属于以下三类之一，请根据内容自行判断属于哪一类并按对应格式回复：
+用户的请求属于以下三类之一。**你的回复必须以下面三个标记之一开头，独占一行**，
+帮助下游程序判断你识别出的任务类型（这不是给用户看的内容，只是一个路由标记）：
 
-## 1. 生成电路 / 2. 修复电路
+```
+[TASK: generate]
+[TASK: fix]
+[TASK: select_backend]
+```
+
+标记之后，请根据内容按对应格式回复：
+
+## [TASK: generate] 生成电路 / [TASK: fix] 修复电路
 用户会描述一个目标量子态或需求，或提供一段有问题的代码要求修复。
+在 `[TASK: ...]` 之后另起一行，加一个 `[TARGET: ...]` 标记，说明你识别出的目标
+态类型（同样是路由标记，不是给用户看的内容）：
+
+```
+[TARGET: ghz]          GHZ 态或贝尔态（多比特最大纠缠态，全 0/全 1 各占一半概率）
+[TARGET: uniform]      均匀叠加态（每个比特独立做 Hadamard，所有基态等概率）
+[TARGET: basis:101]    制备一个确定的计算基态，冒号后是具体的比特串
+[TARGET: other]        以上都不是
+```
+
 两种情况都请输出一段完整、可执行的 OpenQASM 2.0 代码：
 - 只能使用以下 12 个门：h, x, s, sdg, t, tdg, rz(theta), ry(theta), cx, cu1(theta), swap, ccx
 - 必须包含 `include "qelib1.inc";`、`qreg`/`creg` 声明、以及 `measure`
@@ -240,11 +380,12 @@ measure q -> c;
 
 代码块之外可以用一两句话说明你做了什么。
 
-## 3. 选择后端
+## [TASK: select_backend] 选择后端
 用户会描述比特数、排队、真机、费用等约束。请依据下面这份官方后端能力表，选出**唯一**
 满足用户所有约束的后端（如果有多个都满足，选其中一个即可），在回复中明确包含它的
 `id` 字段值（例如 `spinq_taurus_simulator`），并用一两句话说明理由。如果没有任何
-后端满足全部约束，如实说明，并给出最接近的替代方案。
+后端满足全部约束，如实说明，并给出最接近的替代方案。这类回复**不要**包含
+OpenQASM 代码块。
 
 后端能力表（JSON）：
 {backend_table}
@@ -308,20 +449,37 @@ def agent_chat(prompt: str) -> str:
         remaining_attempts = MAX_GENERATION_ATTEMPTS - attempt - 1
         with _temporary_timeout(budget.next_call_timeout(reserved_for_more_calls=remaining_attempts)):
             response = llm_client.chat_completion(conversation)
-        reply = response["choices"][0]["message"]["content"]
+        reply = _extract_reply_content(response)
         conversation.append({"role": "assistant", "content": reply})
 
+        task = _classify_task_tag(reply)
         qasm = extract_qasm(reply)
-        if qasm is None:
-            # No QASM present: treat this as a backend-selection-style reply.
-            # Trust the LLM's natural-language understanding as the primary
-            # path; the deterministic table lookup only overrides it when
-            # extractable constraints show the LLM's answer doesn't satisfy
-            # backend_capabilities.json (the organizers' own stated ground
-            # truth for this task).
+
+        # task is the model's own explicit self-report of which of the three
+        # task types it thinks this is (required as the reply's first line
+        # by SYSTEM_PROMPT) -- trusted when present, since relying only on
+        # "did we happen to find a QASM code block" misroutes a backend-
+        # selection answer that happens to quote example code in its
+        # explanation, and equally misroutes a generation answer that failed
+        # to follow the code-block format (silently treated as if it were a
+        # valid backend-selection reply instead of a failed attempt to fix).
+        if task == "select_backend":
             return _apply_backend_selection_safety_net(prompt, reply)
 
-        ok, feedback = _verify_generated_circuit(prompt, qasm)
+        if task in ("generate", "fix"):
+            if qasm is None:
+                ok, feedback = False, "回复中没有找到符合格式要求的 OpenQASM 2.0 代码块"
+            else:
+                ok, feedback = _verify_generated_circuit(prompt, reply, qasm)
+        elif qasm is not None:
+            # No tag recognized (model didn't follow the instruction) but a
+            # QASM block is present -- fall back to the original heuristic.
+            ok, feedback = _verify_generated_circuit(prompt, reply, qasm)
+        else:
+            # No tag, no QASM -- fall back to the original heuristic: treat
+            # as a backend-selection-style reply.
+            return _apply_backend_selection_safety_net(prompt, reply)
+
         if ok or remaining_attempts == 0 or budget.remaining() <= 0:
             return reply
 
@@ -331,7 +489,8 @@ def agent_chat(prompt: str) -> str:
                 "content": (
                     f"这段电路没有通过校验：{feedback}。"
                     "请在保持用户原始目标不变的前提下修复电路，"
-                    "仍然只输出一个完整的 OpenQASM 2.0 代码块。"
+                    "仍然以 [TASK: generate] 或 [TASK: fix] 开头，"
+                    "并只输出一个完整的 OpenQASM 2.0 代码块。"
                 ),
             }
         )
