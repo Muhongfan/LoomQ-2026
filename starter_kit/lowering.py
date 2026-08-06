@@ -12,9 +12,14 @@ arrives and it gets audited).
 from dataclasses import replace
 from typing import Dict, FrozenSet, List
 
-from .circuit_ir import Circuit, GateOp
-from .gate_identities import DECOMPOSITIONS
-from .validator import WHITELIST
+try:
+    from .circuit_ir import Circuit, GateOp
+    from .gate_identities import DECOMPOSITIONS
+    from .validator import WHITELIST
+except ImportError:
+    from circuit_ir import Circuit, GateOp
+    from gate_identities import DECOMPOSITIONS
+    from validator import WHITELIST
 
 SUPPORTED_GATES: Dict[str, FrozenSet[str]] = {
     "spinq": WHITELIST,
