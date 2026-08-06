@@ -59,9 +59,12 @@ class AdapterRunTests(unittest.TestCase):
         observed = {k: v / result["shots"] for k, v in result["counts"].items()}
         self.assertGreaterEqual(calculate_hellinger_fidelity(observed, BELL_IDEAL), 0.97)
 
-    def test_run_originq_raises_not_implemented(self):
-        with self.assertRaises(NotImplementedError):
-            adapter.run(BELL_QASM, "originq", shots=100)
+    def test_run_originq_meets_fidelity_threshold(self):
+        result = adapter.run(BELL_QASM, "originq", shots=8192)
+        valid, reason = validate_schema(result)
+        self.assertTrue(valid, reason)
+        observed = {k: v / result["shots"] for k, v in result["counts"].items()}
+        self.assertGreaterEqual(calculate_hellinger_fidelity(observed, BELL_IDEAL), 0.97)
 
 
 if __name__ == "__main__":

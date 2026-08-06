@@ -49,6 +49,22 @@ class RunnerPublicCircuitFidelityTests(unittest.TestCase):
         observed = {k: v / result["shots"] for k, v in result["counts"].items()}
         self.assertGreaterEqual(calculate_hellinger_fidelity(observed, GHZ3_IDEAL), 0.97)
 
+    def test_originq_bell_meets_fidelity_threshold(self):
+        circuit = parse_qasm2((CIRCUITS / "bell.qasm").read_text(encoding="utf-8"))
+        result = run(circuit, "originq", shots=8192)
+        valid, reason = validate_schema(result)
+        self.assertTrue(valid, reason)
+        observed = {k: v / result["shots"] for k, v in result["counts"].items()}
+        self.assertGreaterEqual(calculate_hellinger_fidelity(observed, BELL_IDEAL), 0.97)
+
+    def test_originq_ghz3_meets_fidelity_threshold(self):
+        circuit = parse_qasm2((CIRCUITS / "ghz3.qasm").read_text(encoding="utf-8"))
+        result = run(circuit, "originq", shots=8192)
+        valid, reason = validate_schema(result)
+        self.assertTrue(valid, reason)
+        observed = {k: v / result["shots"] for k, v in result["counts"].items()}
+        self.assertGreaterEqual(calculate_hellinger_fidelity(observed, GHZ3_IDEAL), 0.97)
+
 
 class RunnerBitOrderNormalizationTests(unittest.TestCase):
     """x q[0]; measure q[0]->c[1]; measure q[1]->c[0]; is deterministic:
@@ -67,6 +83,16 @@ class RunnerBitOrderNormalizationTests(unittest.TestCase):
         result = run(circuit, "braket", shots=16)
         self.assertEqual(result["counts"], {"10": 16})
 
+    def test_originq_native_output_already_matches_contract(self):
+        """Unlike spinqit/braket, pyqpanda's OriginIR MEASURE respects the
+        target index directly and its raw string already matches the
+        contract's convention -- _normalize_originq_counts is a pass-through,
+        so this confirms no remapping bug slipped in, not that one was fixed.
+        """
+        circuit = parse_qasm2(SCRAMBLED_MAPPING_QASM)
+        result = run(circuit, "originq", shots=16)
+        self.assertEqual(result["counts"], {"10": 16})
+
 
 class RunnerValidationAndDispatchTests(unittest.TestCase):
     def test_invalid_gate_raises_before_touching_a_backend(self):
@@ -75,11 +101,6 @@ class RunnerValidationAndDispatchTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "whitelist"):
             run(circuit, "spinq", shots=100)
-
-    def test_originq_not_yet_implemented(self):
-        circuit = parse_qasm2((CIRCUITS / "bell.qasm").read_text(encoding="utf-8"))
-        with self.assertRaises(NotImplementedError):
-            run(circuit, "originq", shots=100)
 
 
 if __name__ == "__main__":
