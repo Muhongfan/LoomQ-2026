@@ -551,13 +551,23 @@ DEFAULT_CASE_BUDGET_SECONDS = 100.0
 MAX_GENERATION_ATTEMPTS = 3
 
 
-def agent_chat(prompt: str) -> str:
-    system_prompt = SYSTEM_PROMPT.format(backend_table=_backend_capabilities_text())
+def _run_conversation_turn(conversation: List[Dict[str, str]], prompt: str) -> str:
+    """Core per-turn logic (call, route, verify, retry), operating on a
+    caller-supplied `conversation` list it appends to in place. Shared by:
+
+    - agent_chat(): the graded contract. Builds a FRESH conversation (just
+      system prompt + this one turn) on every call, matching how the
+      official evaluator invokes it -- each of the 12 hidden L2 cases runs
+      independently, with no memory of any other case, so agent_chat() must
+      never accumulate state across calls.
+    - send_message(): used by chat_cli.py for genuine multi-turn memory in
+      an interactive session (see start_session()). This is deliberately a
+      separate function rather than a parameter on agent_chat(), so there is
+      no risk of accidentally changing the graded function's fixed
+      single-string signature or its no-memory-between-calls behavior.
+    """
+    conversation.append({"role": "user", "content": prompt})
     budget = TimeBudget(DEFAULT_CASE_BUDGET_SECONDS)
-    conversation = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": prompt},
-    ]
 
     reply = ""
     for attempt in range(MAX_GENERATION_ATTEMPTS):
@@ -620,3 +630,30 @@ def agent_chat(prompt: str) -> str:
         )
 
     return reply
+
+
+def agent_chat(prompt: str) -> str:
+    """The graded L2 contract: called fresh, with no memory of any other
+    call. Do not add a history/session parameter here -- see
+    _run_conversation_turn's docstring for why that belongs in
+    start_session()/send_message() instead."""
+    system_prompt = SYSTEM_PROMPT.format(backend_table=_backend_capabilities_text())
+    conversation = [{"role": "system", "content": system_prompt}]
+    return _run_conversation_turn(conversation, prompt)
+
+
+def start_session() -> List[Dict[str, str]]:
+    """Begins a fresh multi-turn conversation for interactive use (chat_cli.py),
+    seeded with the system prompt. Pass the returned list to send_message()
+    on each turn; it accumulates history in place, giving the CLI genuine
+    cross-turn memory (e.g. "generate a Bell state" -> "now make it 5 qubits"
+    correctly refers back to the previous turn) -- something agent_chat()
+    deliberately does not provide, since the graded contract must not
+    depend on call ordering or persisted state between cases."""
+    system_prompt = SYSTEM_PROMPT.format(backend_table=_backend_capabilities_text())
+    return [{"role": "system", "content": system_prompt}]
+
+
+def send_message(conversation: List[Dict[str, str]], prompt: str) -> str:
+    """Continues a multi-turn conversation started by start_session()."""
+    return _run_conversation_turn(conversation, prompt)

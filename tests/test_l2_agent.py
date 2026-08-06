@@ -295,6 +295,45 @@ measure q -> c;
 GHZ3_PROMPT = "生成一个 3 比特 GHZ 态并进行全测量"
 
 
+class SessionMemoryTests(SequencedMockLLMServerTestCase):
+    def test_start_session_is_seeded_with_the_system_prompt(self):
+        session = l2_agent.start_session()
+        self.assertEqual(len(session), 1)
+        self.assertEqual(session[0]["role"], "system")
+        self.assertIn("spinq_taurus_simulator", session[0]["content"])
+
+    def test_send_message_sends_full_accumulated_history_on_second_turn(self):
+        # This is the actual memory guarantee for chat_cli.py: a follow-up
+        # like "now make it 5 qubits" only makes sense to the model if the
+        # first turn's user+assistant messages are still in the request.
+        SequencedAPIHandler.reply_sequence = ["ok" for _ in range(3)]
+        session = l2_agent.start_session()
+
+        l2_agent.send_message(session, "生成一个贝尔态")
+        first_request = SequencedAPIHandler.captured_payloads[0]["messages"]
+        self.assertEqual(len(first_request), 2)  # system + this turn's user message
+
+        l2_agent.send_message(session, "把比特数改成 5 个")
+        second_request = SequencedAPIHandler.captured_payloads[1]["messages"]
+        self.assertEqual(len(second_request), 4)  # system, user1, assistant1, user2
+        self.assertEqual(second_request[1]["content"], "生成一个贝尔态")
+        self.assertEqual(second_request[2]["content"], "ok")
+        self.assertEqual(second_request[3]["content"], "把比特数改成 5 个")
+
+    def test_agent_chat_does_not_share_state_across_separate_calls(self):
+        # The graded contract: two independent agent_chat() calls must each
+        # start fresh, unlike send_message() reusing one session.
+        SequencedAPIHandler.reply_sequence = ["ok", "ok"]
+        l2_agent.agent_chat("生成一个贝尔态")
+        first_request = SequencedAPIHandler.captured_payloads[0]["messages"]
+
+        l2_agent.agent_chat("把比特数改成 5 个")
+        second_request = SequencedAPIHandler.captured_payloads[1]["messages"]
+
+        self.assertEqual(len(first_request), 2)
+        self.assertEqual(len(second_request), 2)  # NOT 4 -- no memory of the first call
+
+
 class RetryLoopTests(SequencedMockLLMServerTestCase):
     def test_retries_after_failed_verification_and_returns_fixed_circuit(self):
         SequencedAPIHandler.reply_sequence = [BROKEN_GHZ3_REPLY, FIXED_GHZ3_REPLY]
