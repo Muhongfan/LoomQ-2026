@@ -8,3 +8,6 @@ __pycache__/
 .venv/
 .venv-clean-check/
 tools/
+ROADMAP.md
+.env
+.env.*
