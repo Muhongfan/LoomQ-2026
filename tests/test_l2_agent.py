@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import threading
 import time
@@ -122,6 +123,44 @@ class GenerationRoundTripTests(MockLLMServerTestCase):
         validate_circuit(circuit)  # must not raise
 
 
+# Captured verbatim from a real DeepSeek call during Phase 5 testing, after
+# adding the mixed-task instruction to SYSTEM_PROMPT: given "generate a
+# 3-qubit GHZ state, and tell me which backend to run it on with zero
+# queue", the model used to silently drop the backend-selection half of the
+# request entirely. It now answers the primary (generation) task in full
+# and explicitly tells the user to ask the backend question separately,
+# instead of silently ignoring it.
+MIXED_TASK_ACKNOWLEDGMENT_REPLY = """[TASK: generate]
+[TARGET: ghz]
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+cx q[0],q[1];
+cx q[0],q[2];
+measure q -> c;
+```
+
+我生成了 3 比特 GHZ 态：先对 q[0] 做 Hadamard 得到叠加态，再通过两个 CNOT 门将纠缠扩展到 q[1] 和 q[2]，最终得到 (|000⟩ + |111⟩)/√2。
+
+你的问题里还包含选后端请求，请单独再问一次，我可以专门回答。
+"""
+
+
+class MixedTaskAcknowledgmentTests(MockLLMServerTestCase):
+    def test_generation_half_still_verifies_and_acknowledgment_is_preserved(self):
+        ScriptedAPIHandler.reply_content = MIXED_TASK_ACKNOWLEDGMENT_REPLY
+        reply = l2_agent.agent_chat("生成一个 3 比特 GHZ 态，并告诉我用哪个后端跑最好，要求零排队")
+
+        # verified correctly (single call, not retried) and the
+        # acknowledgment text wasn't stripped by any downstream processing.
+        self.assertEqual(l2_agent.extract_qasm(reply), l2_agent.extract_qasm(MIXED_TASK_ACKNOWLEDGMENT_REPLY))
+        self.assertIn("请单独再问一次", reply)
+
+
 class MissingEnvironmentTests(unittest.TestCase):
     def test_missing_environment_raises_and_does_not_fall_back_to_mock_data(self):
         with mock.patch.dict(os.environ, {}, clear=True):
@@ -167,6 +206,686 @@ class TemporaryTimeoutTests(unittest.TestCase):
             with l2_agent._temporary_timeout(7.5):
                 self.assertIn("LOOMQ_LLM_TIMEOUT_SECONDS", os.environ)
             self.assertNotIn("LOOMQ_LLM_TIMEOUT_SECONDS", os.environ)
+
+
+class SequencedAPIHandler(BaseHTTPRequestHandler):
+    """Returns a different scripted reply on each successive call, so the
+    retry loop's second (corrected) attempt can be distinguished from its
+    first (broken) one."""
+
+    reply_sequence = []
+    call_count = 0
+    captured_payloads = []
+
+    def log_message(self, *_args):
+        return
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        payload = json.loads(self.rfile.read(length))
+        type(self).captured_payloads.append(payload)
+        index = min(type(self).call_count, len(type(self).reply_sequence) - 1)
+        content = type(self).reply_sequence[index]
+        type(self).call_count += 1
+        body = json.dumps(
+            {"choices": [{"message": {"role": "assistant", "content": content}}]}
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+class SequencedMockLLMServerTestCase(unittest.TestCase):
+    def setUp(self):
+        SequencedAPIHandler.call_count = 0
+        SequencedAPIHandler.captured_payloads = []
+        SequencedAPIHandler.reply_sequence = []
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), SequencedAPIHandler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.environ_patch = mock.patch.dict(
+            os.environ,
+            {
+                "LOOMQ_LLM_BASE_URL": "http://127.0.0.1:%d" % self.server.server_port,
+                "LOOMQ_LLM_API_KEY": "local-key",
+                "LOOMQ_LLM_MODEL": "local-model",
+                "LOOMQ_LLM_TIMEOUT_SECONDS": "5",
+            },
+            clear=True,
+        )
+        self.environ_patch.start()
+
+    def tearDown(self):
+        self.environ_patch.stop()
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=2)
+
+
+# h only, no entanglement -- fidelity against the GHZ-3 ideal {"000":0.5,"111":0.5}
+# will be far below 0.97 (q1/q2 never become |1>), reliably triggering a retry.
+BROKEN_GHZ3_REPLY = """这是电路：
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+measure q -> c;
+```
+"""
+
+FIXED_GHZ3_REPLY = """修好了：
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+cx q[0],q[1];
+cx q[1],q[2];
+measure q -> c;
+```
+"""
+
+GHZ3_PROMPT = "生成一个 3 比特 GHZ 态并进行全测量"
+
+
+class SessionMemoryTests(SequencedMockLLMServerTestCase):
+    def test_start_session_is_seeded_with_the_system_prompt(self):
+        session = l2_agent.start_session()
+        self.assertEqual(len(session), 1)
+        self.assertEqual(session[0]["role"], "system")
+        self.assertIn("spinq_taurus_simulator", session[0]["content"])
+
+    def test_send_message_sends_full_accumulated_history_on_second_turn(self):
+        # This is the actual memory guarantee for chat_cli.py: a follow-up
+        # like "now make it 5 qubits" only makes sense to the model if the
+        # first turn's user+assistant messages are still in the request.
+        SequencedAPIHandler.reply_sequence = ["ok" for _ in range(3)]
+        session = l2_agent.start_session()
+
+        l2_agent.send_message(session, "生成一个贝尔态")
+        first_request = SequencedAPIHandler.captured_payloads[0]["messages"]
+        self.assertEqual(len(first_request), 2)  # system + this turn's user message
+
+        l2_agent.send_message(session, "把比特数改成 5 个")
+        second_request = SequencedAPIHandler.captured_payloads[1]["messages"]
+        self.assertEqual(len(second_request), 4)  # system, user1, assistant1, user2
+        self.assertEqual(second_request[1]["content"], "生成一个贝尔态")
+        self.assertEqual(second_request[2]["content"], "ok")
+        self.assertEqual(second_request[3]["content"], "把比特数改成 5 个")
+
+    def test_agent_chat_does_not_share_state_across_separate_calls(self):
+        # The graded contract: two independent agent_chat() calls must each
+        # start fresh, unlike send_message() reusing one session.
+        SequencedAPIHandler.reply_sequence = ["ok", "ok"]
+        l2_agent.agent_chat("生成一个贝尔态")
+        first_request = SequencedAPIHandler.captured_payloads[0]["messages"]
+
+        l2_agent.agent_chat("把比特数改成 5 个")
+        second_request = SequencedAPIHandler.captured_payloads[1]["messages"]
+
+        self.assertEqual(len(first_request), 2)
+        self.assertEqual(len(second_request), 2)  # NOT 4 -- no memory of the first call
+
+
+class RetryLoopTests(SequencedMockLLMServerTestCase):
+    def test_retries_after_failed_verification_and_returns_fixed_circuit(self):
+        SequencedAPIHandler.reply_sequence = [BROKEN_GHZ3_REPLY, FIXED_GHZ3_REPLY]
+        reply = l2_agent.agent_chat(GHZ3_PROMPT)
+
+        self.assertEqual(SequencedAPIHandler.call_count, 2)
+        self.assertEqual(l2_agent.extract_qasm(reply), l2_agent.extract_qasm(FIXED_GHZ3_REPLY))
+
+    def test_second_request_includes_corrective_feedback(self):
+        SequencedAPIHandler.reply_sequence = [BROKEN_GHZ3_REPLY, FIXED_GHZ3_REPLY]
+        l2_agent.agent_chat(GHZ3_PROMPT)
+
+        second_request_messages = SequencedAPIHandler.captured_payloads[1]["messages"]
+        # system, user(original), assistant(broken reply), user(corrective feedback)
+        self.assertEqual(len(second_request_messages), 4)
+        self.assertEqual(second_request_messages[2]["content"], BROKEN_GHZ3_REPLY)
+        self.assertIn("没有通过校验", second_request_messages[3]["content"])
+
+    def test_correct_circuit_on_first_try_does_not_retry(self):
+        SequencedAPIHandler.reply_sequence = [FIXED_GHZ3_REPLY]
+        l2_agent.agent_chat(GHZ3_PROMPT)
+        self.assertEqual(SequencedAPIHandler.call_count, 1)
+
+    def test_gives_up_after_max_attempts_and_returns_last_reply(self):
+        SequencedAPIHandler.reply_sequence = [BROKEN_GHZ3_REPLY] * l2_agent.MAX_GENERATION_ATTEMPTS
+        reply = l2_agent.agent_chat(GHZ3_PROMPT)
+
+        self.assertEqual(SequencedAPIHandler.call_count, l2_agent.MAX_GENERATION_ATTEMPTS)
+        self.assertEqual(reply, BROKEN_GHZ3_REPLY)
+
+    def test_reply_without_qasm_is_returned_immediately_without_verification(self):
+        SequencedAPIHandler.reply_sequence = ["建议使用 spinq_taurus_simulator，满足零排队要求。"]
+        reply = l2_agent.agent_chat("我需要运行一个 15 比特电路，且零排队等待，选哪个平台？")
+
+        self.assertEqual(SequencedAPIHandler.call_count, 1)
+        self.assertIn("spinq_taurus_simulator", reply)
+
+
+class ConstraintExtractionTests(unittest.TestCase):
+    """The three official examples from backend_capabilities.md, used
+    verbatim as acceptance tests for the deterministic constraint
+    extraction + matching logic."""
+
+    def setUp(self):
+        self.backends = l2_agent._load_backend_capabilities()
+
+    def test_fifteen_qubit_zero_queue_matches_official_answer_set(self):
+        constraints = l2_agent._extract_backend_constraints(
+            "我需要运行一个 15 比特电路，且零排队等待，选哪个平台？"
+        )
+        candidates = {b["id"] for b in l2_agent._matching_backends(constraints, self.backends)}
+        self.assertEqual(
+            candidates, {"spinq_taurus_simulator", "originq_local_simulator", "braket_local_simulator"}
+        )
+
+    def test_five_qubit_real_hardware_no_cost_matches_official_answer_set(self):
+        constraints = l2_agent._extract_backend_constraints("在真实量子硬件上跑一个 5 比特电路，不想花钱")
+        candidates = {b["id"] for b in l2_agent._matching_backends(constraints, self.backends)}
+        self.assertEqual(candidates, {"spinq_cloud_qpu", "originq_wukong"})
+
+    def test_exceeding_every_backend_yields_no_candidates(self):
+        constraints = l2_agent._extract_backend_constraints("我需要一个 100 比特的电路，有什么建议？")
+        candidates = l2_agent._matching_backends(constraints, self.backends)
+        self.assertEqual(candidates, [])
+
+    def test_english_qubit_phrasing_is_also_recognized(self):
+        constraints = l2_agent._extract_backend_constraints(
+            "I need to run a 15-qubit circuit with zero queue, which platform should I use?"
+        )
+        self.assertEqual(constraints["min_qubits"], 15)
+        self.assertTrue(constraints["queue_none"])
+
+    def test_ambiguous_prompt_extracts_no_constraints(self):
+        self.assertEqual(l2_agent._extract_backend_constraints("你好，能帮帮我吗？"), {})
+
+
+class BackendSelectionSafetyNetTests(unittest.TestCase):
+    def test_correct_llm_answer_is_returned_unchanged(self):
+        reply = "推荐使用 spinq_taurus_simulator，它没有排队且比特数足够。"
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我需要运行一个 15 比特电路，且零排队等待，选哪个平台？", reply
+        )
+        self.assertEqual(result, reply)
+
+    def test_wrong_llm_answer_gets_corrected_to_a_valid_id(self):
+        reply = "推荐使用 braket_cloud，它性能很强。"  # paid, wrong for a zero-queue-free ask
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我需要运行一个 15 比特电路，且零排队等待，选哪个平台？", reply
+        )
+        self.assertIn(
+            l2_agent._BACKEND_ID_RE.search(result).group(1),
+            {"spinq_taurus_simulator", "originq_local_simulator", "braket_local_simulator"},
+        )
+
+    def test_missing_id_in_llm_answer_gets_corrected(self):
+        reply = "这个应该用本地模拟器就可以了，具体哪个都行。"
+        result = l2_agent._apply_backend_selection_safety_net(
+            "在真实量子硬件上跑一个 5 比特电路，不想花钱", reply
+        )
+        found = set(l2_agent._BACKEND_ID_RE.findall(result))
+        self.assertTrue(found & {"spinq_cloud_qpu", "originq_wukong"})
+
+    def test_no_backend_satisfies_gives_honest_answer_with_alternative(self):
+        reply = "可以试试某个后端。"
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我需要一个 100 比特的电路，有什么建议？", reply
+        )
+        self.assertIn("没有任何后端", result)
+        self.assertIn("originq_wukong", result)  # largest max_qubits (72) in the table
+
+    def test_llm_already_honest_about_no_fit_is_kept_unchanged(self):
+        # Captured verbatim from a real DeepSeek call during Phase 5 testing:
+        # the model correctly concluded no backend fits and explained why in
+        # more detail than our own template -- must not be discarded.
+        reply = (
+            "[TASK: select_backend]\n\n根据后端能力表，没有任何后端支持 100 比特的真机运行"
+            "——表中最大的真机是本源悟空（72 比特），且它是唯一支持超过 8 比特的真机。"
+            "因此没有后端能满足“100 比特 + 真机”这一组合约束。\n\n"
+            "最接近的替代方案是 **`originq_wukong`**（本源悟空超导真机，72 比特），"
+            "它是当前唯一能承载大规模电路的真机，但最大仅 72 比特。"
+        )
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我要在真机上跑一个 100 比特的电路", reply
+        )
+        self.assertEqual(result, reply)
+
+    def test_llm_already_honest_about_conflicting_constraints_is_kept_unchanged(self):
+        # Also captured verbatim: a genuinely conflicting constraint set
+        # (originq_wukong meets qubit count + real hardware + free quota,
+        # but its queue is "hours", not "none").
+        reply = (
+            "[TASK: select_backend]\n\n根据后端能力表，**没有任何后端能同时满足"
+            "“不排队 + 免费 + 真机 + 72 比特”**这四个约束：\n\n"
+            "- 真机中比特数达到 72 的只有 `originq_wukong`（本源悟空），但它**排队数小时**，且需要注册账号。\n"
+            "- 其他真机（`spinq_cloud_qpu`）比特数只有 8，不满足 72 比特。\n"
+            "- 免费且不排队的都是**模拟器**"
+        )
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我要一个不排队、免费、还要在真机上跑的 72 比特电路", reply
+        )
+        self.assertEqual(result, reply)
+
+    def test_dishonest_no_id_reply_still_gets_the_template_fallback(self):
+        # No acknowledgement of "no fit" at all -- must still fall back to
+        # the honest template rather than silently returning something vague.
+        reply = "可以试试某个后端。"
+        result = l2_agent._apply_backend_selection_safety_net(
+            "我要在真机上跑一个 100 比特的电路", reply
+        )
+        self.assertIn("没有任何后端", result)
+
+    def test_ambiguous_prompt_trusts_llm_reply_unchanged(self):
+        reply = "随便一个都行。"
+        result = l2_agent._apply_backend_selection_safety_net("你好，能帮帮我吗？", reply)
+        self.assertEqual(result, reply)
+
+
+class BackendSelectionEndToEndTests(MockLLMServerTestCase):
+    def test_agent_chat_corrects_a_wrong_backend_answer(self):
+        ScriptedAPIHandler.reply_content = "用 braket_cloud 吧。"
+        reply = l2_agent.agent_chat("我需要运行一个 15 比特电路，且零排队等待，选哪个平台？")
+        found = set(l2_agent._BACKEND_ID_RE.findall(reply))
+        self.assertTrue(
+            found & {"spinq_taurus_simulator", "originq_local_simulator", "braket_local_simulator"}
+        )
+
+
+class TaskTagClassificationTests(unittest.TestCase):
+    def test_recognizes_each_tag(self):
+        self.assertEqual(l2_agent._classify_task_tag("[TASK: generate]\n..."), "generate")
+        self.assertEqual(l2_agent._classify_task_tag("[TASK: fix]\n..."), "fix")
+        self.assertEqual(l2_agent._classify_task_tag("[TASK: select_backend]\n..."), "select_backend")
+        self.assertEqual(l2_agent._classify_task_tag("[TASK: clarify]\n..."), "clarify")
+
+    def test_case_and_leading_whitespace_insensitive(self):
+        self.assertEqual(l2_agent._classify_task_tag("  [task: GENERATE]\nfoo"), "generate")
+
+    def test_missing_tag_returns_none(self):
+        self.assertIsNone(l2_agent._classify_task_tag("这是一段没有标记的回复"))
+
+    def test_tag_not_on_first_line_is_not_recognized(self):
+        # Must be the reply's own first line, not a mention buried later.
+        self.assertIsNone(l2_agent._classify_task_tag("先说点别的。\n[TASK: generate]\n..."))
+
+
+class ReplyContentExtractionTests(unittest.TestCase):
+    def test_extracts_content_from_well_formed_response(self):
+        response = {"choices": [{"message": {"role": "assistant", "content": "hello"}}]}
+        self.assertEqual(l2_agent._extract_reply_content(response), "hello")
+
+    def test_empty_choices_raises_clear_error(self):
+        with self.assertRaisesRegex(RuntimeError, "no choices"):
+            l2_agent._extract_reply_content({"choices": []})
+
+    def test_missing_message_raises_clear_error(self):
+        with self.assertRaisesRegex(RuntimeError, "no message content"):
+            l2_agent._extract_reply_content({"choices": [{}]})
+
+    def test_non_string_content_raises_clear_error(self):
+        with self.assertRaisesRegex(RuntimeError, "not a string"):
+            l2_agent._extract_reply_content({"choices": [{"message": {"content": 42}}]})
+
+    def test_non_dict_response_raises_clear_error(self):
+        with self.assertRaisesRegex(RuntimeError, "not a JSON object"):
+            l2_agent._extract_reply_content(["unexpected", "list"])
+
+
+# The two misclassification scenarios _classify_task_tag exists to fix:
+# a backend-selection answer that happens to quote example QASM in its
+# explanation, and a generation answer that forgot the code-block format.
+BACKEND_SELECTION_WITH_EMBEDDED_CODE_SNIPPET = """[TASK: select_backend]
+建议使用 spinq_taurus_simulator。举例来说，一个简单电路大概长这样：
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[2];
+creg c[2];
+h q[0];
+cx q[0],q[1];
+measure q -> c;
+```
+这个平台零排队、免费、比特数也够用。
+"""
+
+GENERATE_MISSING_CODE_BLOCK = "[TASK: generate]\n好的，我需要制备一个 3 比特 GHZ 态。"
+
+# Captured (paraphrased) from a real DeepSeek call during Phase 5 testing:
+# given pure nonsense input ("asdkjaslkdj 请帮我弄一个 qwerty 谢谢"), the model
+# reasonably refused to fabricate a circuit and asked for clarification --
+# before [TASK: clarify] existed, this was misrouted into the generate/fix
+# branch (no QASM found -> "bad format" -> retry), burning 3 real API calls
+# on a request that was never going to produce a circuit.
+CLARIFICATION_NEEDED_REPLY = """[TASK: clarify]
+
+我理解你想要一些帮助，但你的消息中没有提供任何具体的电路代码或目标态描述。
+我无法凭空生成或修复一段不存在的代码。请说明你的目标态（例如 GHZ、均匀叠加，
+或某个基态），或者贴出需要修复的 OpenQASM 代码。
+"""
+
+
+class TaskTagRoutingTests(SequencedMockLLMServerTestCase):
+    def test_clarify_tag_returns_immediately_without_retry(self):
+        SequencedAPIHandler.reply_sequence = [CLARIFICATION_NEEDED_REPLY]
+        reply = l2_agent.agent_chat("asdkjaslkdj 请帮我弄一个 qwerty 谢谢")
+
+        self.assertEqual(SequencedAPIHandler.call_count, 1)  # no wasted retries
+        self.assertEqual(reply, CLARIFICATION_NEEDED_REPLY)
+
+    def test_backend_selection_reply_with_embedded_code_is_not_misread_as_generation(self):
+        # Without the tag, extract_qasm would find the embedded snippet and
+        # misroute this into circuit verification instead of the backend
+        # safety net -- confirms the tag fix prevents that.
+        SequencedAPIHandler.reply_sequence = [BACKEND_SELECTION_WITH_EMBEDDED_CODE_SNIPPET]
+        reply = l2_agent.agent_chat("我需要运行一个 15 比特电路，且零排队等待，选哪个平台？")
+
+        self.assertEqual(SequencedAPIHandler.call_count, 1)  # not retried as a broken circuit
+        self.assertIn("spinq_taurus_simulator", reply)
+
+    def test_generation_reply_missing_code_block_triggers_retry_not_silent_misroute(self):
+        # Without the tag, "no QASM found" always meant "treat as backend
+        # selection" -- silently returning this reply as if it answered a
+        # backend question. With the tag, we know it was meant to generate
+        # a circuit and failed the format requirement, so it must retry.
+        SequencedAPIHandler.reply_sequence = [GENERATE_MISSING_CODE_BLOCK, FIXED_GHZ3_REPLY]
+        reply = l2_agent.agent_chat(GHZ3_PROMPT)
+
+        self.assertEqual(SequencedAPIHandler.call_count, 2)
+        self.assertEqual(l2_agent.extract_qasm(reply), l2_agent.extract_qasm(FIXED_GHZ3_REPLY))
+
+    def test_second_request_after_missing_code_block_asks_for_the_format(self):
+        SequencedAPIHandler.reply_sequence = [GENERATE_MISSING_CODE_BLOCK, FIXED_GHZ3_REPLY]
+        l2_agent.agent_chat(GHZ3_PROMPT)
+
+        second_request_messages = SequencedAPIHandler.captured_payloads[1]["messages"]
+        self.assertIn("没有找到符合格式要求", second_request_messages[3]["content"])
+
+
+class TargetTagClassificationTests(unittest.TestCase):
+    def test_recognizes_each_variant(self):
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: ghz]\n..."), "ghz")
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: bell]\n..."), "bell")
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: uniform]\n..."), "uniform")
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: basis:101]\n..."), "basis:101")
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: other]\n..."), "other")
+        self.assertEqual(l2_agent._classify_target_tag("[TARGET: prob:0:0.3]\n..."), "prob:0:0.3")
+
+    def test_missing_tag_returns_none(self):
+        self.assertIsNone(l2_agent._classify_target_tag("没有任何标记的回复"))
+
+
+class ProbabilityTagParsingTests(unittest.TestCase):
+    def test_parses_qubit_and_probability(self):
+        self.assertEqual(l2_agent._parse_probability_tag("prob:0:0.3"), (0, 0.3))
+        self.assertEqual(l2_agent._parse_probability_tag("prob:2:0.75"), (2, 0.75))
+
+    def test_non_probability_tag_returns_none(self):
+        self.assertIsNone(l2_agent._parse_probability_tag("ghz"))
+        self.assertIsNone(l2_agent._parse_probability_tag("other"))
+
+
+# Real bug found during Phase 5 testing: for "let qubit 0 have P(1) = 30%",
+# a real DeepSeek reply stated the correct formula (theta = 2*arccos(sqrt(0.7)))
+# in its explanation, but plugged in ry(1.9823) -- the value for 2*arccos(sqrt(0.3))
+# instead, actually producing P(1) ~= 70%. This request shape matched no
+# recognized family before [TARGET: prob:...] existed, so verification
+# silently passed a circuit that measurably did not do what was asked.
+_CORRECT_THETA_FOR_30_PERCENT = 2 * math.asin(math.sqrt(0.3))
+
+
+class ProbabilityTargetVerificationTests(unittest.TestCase):
+    def _qasm(self, theta: float) -> str:
+        return (
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[1];\ncreg c[1];\n'
+            f"ry({theta!r}) q[0];\nmeasure q -> c;\n"
+        )
+
+    def test_correct_angle_passes(self):
+        qasm = self._qasm(_CORRECT_THETA_FOR_30_PERCENT)
+        reply = "[TASK: generate]\n[TARGET: prob:0:0.3]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit("...", reply, qasm)
+        self.assertTrue(ok, feedback)
+
+    def test_swapped_angle_from_the_real_bug_is_caught(self):
+        # This is the exact wrong value (ry(1.9823)) captured from the real
+        # DeepSeek reply -- must now fail instead of silently passing.
+        qasm = self._qasm(1.9823)
+        reply = "[TASK: generate]\n[TARGET: prob:0:0.3]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit("...", reply, qasm)
+        self.assertFalse(ok)
+        self.assertIn("30.0%", feedback)
+        self.assertIn("70", feedback)  # observed probability is ~70%
+
+    def test_qubit_index_out_of_range_is_rejected(self):
+        qasm = self._qasm(_CORRECT_THETA_FOR_30_PERCENT)
+        reply = "[TASK: generate]\n[TARGET: prob:5:0.3]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit("...", reply, qasm)
+        self.assertFalse(ok)
+        self.assertIn("超出", feedback)
+
+
+class TargetRecognitionTests(unittest.TestCase):
+    def test_tag_is_trusted_even_when_prompt_has_no_matching_keywords(self):
+        # Deliberately avoids "GHZ"/"贝尔"/"纠缠"/"叠加" so the prompt-based
+        # fallback alone would find nothing -- proves the tag does real work.
+        prompt = "帮我做一个三个粒子永远同增同减的量子态"
+        reply = "[TASK: generate]\n[TARGET: ghz]\n..."
+        ideal, family = l2_agent._recognize_target(prompt, reply, n_clbits=3)
+        self.assertEqual(family, "ghz")
+        self.assertEqual(ideal, {"000": 0.5, "111": 0.5})
+
+    def test_basis_tag_with_wrong_length_falls_back_to_prompt(self):
+        # basis:1 doesn't match a 3-clbit circuit -- must not be trusted as-is.
+        reply = "[TASK: generate]\n[TARGET: basis:1]\n..."
+        ideal, family = l2_agent._recognize_target("随便生成点什么", reply, n_clbits=3)
+        self.assertIsNone(ideal)
+        self.assertIsNone(family)
+
+    def test_other_tag_falls_back_to_prompt_based_inference(self):
+        reply = "[TASK: generate]\n[TARGET: other]\n..."
+        ideal, family = l2_agent._recognize_target("生成一个 GHZ 态", reply, n_clbits=3)
+        self.assertEqual(family, "ghz")
+
+    def test_no_tag_uses_prompt_based_fallback(self):
+        ideal, family = l2_agent._recognize_target("生成一个贝尔态", "没有标记的回复", n_clbits=2)
+        self.assertEqual(family, "ghz")
+        self.assertEqual(ideal, {"00": 0.5, "11": 0.5})
+
+
+class MultipleFamilyDetectionTests(unittest.TestCase):
+    def test_single_family_mention_is_not_flagged(self):
+        self.assertFalse(l2_agent._mentions_multiple_families("生成一个 3 比特的最大纠缠态 (GHZ 态)"))
+        self.assertFalse(l2_agent._mentions_multiple_families("我想制备一个贝尔态"))
+        self.assertFalse(l2_agent._mentions_multiple_families("做一个均匀叠加态"))
+
+    def test_composite_description_is_flagged(self):
+        prompt = "生成一个4比特电路：前两个比特纠缠成贝尔态，后两个比特各自做均匀叠加，两部分互不干扰"
+        self.assertTrue(l2_agent._mentions_multiple_families(prompt))
+
+    def test_unrelated_prompt_is_not_flagged(self):
+        self.assertFalse(l2_agent._mentions_multiple_families("生成一个随便的电路"))
+
+
+# The exact real scenario from Phase 5: this circuit (front pair entangled,
+# back two qubits independently in superposition) correctly matches the
+# user's composite request. Before _mentions_multiple_families existed,
+# _verify_generated_circuit misjudged it against a whole-circuit GHZ-4
+# distribution and rejected it, forcing a retry that "corrected" a right
+# answer into a different, fully-entangled circuit the user never asked for.
+COMPOSITE_PROMPT = "生成一个4比特电路：前两个比特纠缠成贝尔态，后两个比特各自做均匀叠加，两部分互不干扰，然后测量全部"
+CORRECT_COMPOSITE_QASM = (
+    'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[4];\ncreg c[4];\n'
+    "h q[0];\ncx q[0],q[1];\nh q[2];\nh q[3];\nmeasure q -> c;\n"
+)
+
+
+class CompositeTargetMitigationTests(unittest.TestCase):
+    def test_correct_composite_circuit_is_no_longer_wrongly_rejected(self):
+        reply = f"[TASK: generate]\n[TARGET: ghz]\n...\n```\n{CORRECT_COMPOSITE_QASM}```\n"
+        ok, feedback = l2_agent._verify_generated_circuit(COMPOSITE_PROMPT, reply, CORRECT_COMPOSITE_QASM)
+        self.assertTrue(ok, feedback)
+
+    def test_structural_checks_still_apply_to_composite_prompts(self):
+        # Even when skipping the single-family fidelity check, a genuinely
+        # broken circuit (no entangling gate despite "纠缠" in the prompt)
+        # must still be caught.
+        broken_qasm = (
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[4];\ncreg c[4];\n'
+            "h q[0];\nh q[1];\nh q[2];\nh q[3];\nmeasure q -> c;\n"
+        )
+        reply = "[TASK: generate]\n[TARGET: ghz]\n..."
+        ok, feedback = l2_agent._verify_generated_circuit(COMPOSITE_PROMPT, reply, broken_qasm)
+        self.assertFalse(ok)
+        self.assertIn("纠缠", feedback)
+
+
+class StructuralSanityCheckTests(unittest.TestCase):
+    def _circuit(self, qasm: str):
+        from starter_kit.circuit_ir import parse_qasm2
+
+        return parse_qasm2(qasm)
+
+    def test_qubit_count_mismatch_is_caught(self):
+        circuit = self._circuit(
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[2];\ncreg c[2];\nh q[0];\nmeasure q -> c;\n'
+        )
+        issue = l2_agent._structural_sanity_check("生成一个 3 比特电路", circuit)
+        self.assertIn("3 个比特", issue)
+        self.assertIn("2 个量子比特", issue)
+
+    def test_matching_qubit_count_is_not_flagged(self):
+        circuit = self._circuit(
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[3];\ncreg c[3];\nh q[0];\nmeasure q -> c;\n'
+        )
+        self.assertIsNone(l2_agent._structural_sanity_check("生成一个 3 比特电路", circuit))
+
+    def test_claimed_entanglement_with_no_entangling_gate_is_caught(self):
+        circuit = self._circuit(
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[2];\ncreg c[2];\nh q[0];\nmeasure q -> c;\n'
+        )
+        issue = l2_agent._structural_sanity_check("我想要一个纠缠态", circuit)
+        self.assertIn("纠缠", issue)
+
+    def test_entanglement_with_a_two_qubit_gate_is_not_flagged(self):
+        circuit = self._circuit(
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[2];\ncreg c[2];\n'
+            "h q[0];\ncx q[0],q[1];\nmeasure q -> c;\n"
+        )
+        self.assertIsNone(l2_agent._structural_sanity_check("我想要一个纠缠态", circuit))
+
+    def test_unrelated_prompt_is_not_flagged(self):
+        circuit = self._circuit(
+            'OPENQASM 2.0;\ninclude "qelib1.inc";\nqreg q[1];\ncreg c[1];\nh q[0];\nmeasure q -> c;\n'
+        )
+        self.assertIsNone(l2_agent._structural_sanity_check("生成一个随便的电路", circuit))
+
+
+class FidelityFeedbackTests(unittest.TestCase):
+    def test_format_distribution_orders_by_probability_and_caps_length(self):
+        dist = {"00": 0.05, "11": 0.5, "01": 0.45}
+        formatted = l2_agent._format_distribution(dist)
+        self.assertTrue(formatted.startswith("{11: 50.0%, 01: 45.0%, 00: 5.0%}"))
+
+    def test_fidelity_failure_feedback_includes_observed_ideal_and_hint(self):
+        observed = {"000": 0.5, "001": 0.5}
+        ideal = {"000": 0.5, "111": 0.5}
+        message = l2_agent._fidelity_failure_feedback("ghz", observed, ideal, 0.5)
+        self.assertIn("0.500", message)
+        self.assertIn("000: 50.0%", message)
+        self.assertIn("111: 50.0%", message)
+        self.assertIn("纠缠门", message)
+
+    def test_unknown_family_omits_hint_gracefully(self):
+        message = l2_agent._fidelity_failure_feedback(None, {"0": 1.0}, {"1": 1.0}, 0.0)
+        self.assertIn("保真度不足", message)
+
+
+BROKEN_GHZ3_TAGGED_REPLY = """[TASK: generate]
+[TARGET: ghz]
+这是电路：
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+measure q -> c;
+```
+"""
+
+FIXED_GHZ3_TAGGED_REPLY = """[TASK: generate]
+[TARGET: ghz]
+修好了：
+
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+cx q[0],q[1];
+cx q[1],q[2];
+measure q -> c;
+```
+"""
+
+
+class RicherFeedbackIntegrationTests(SequencedMockLLMServerTestCase):
+    def test_retry_feedback_includes_distributions_and_family_hint(self):
+        SequencedAPIHandler.reply_sequence = [BROKEN_GHZ3_TAGGED_REPLY, FIXED_GHZ3_TAGGED_REPLY]
+        l2_agent.agent_chat(GHZ3_PROMPT)
+
+        second_request_messages = SequencedAPIHandler.captured_payloads[1]["messages"]
+        feedback = second_request_messages[3]["content"]
+        self.assertIn("实际测量分布", feedback)
+        self.assertIn("目标分布应为", feedback)
+        self.assertIn("纠缠门", feedback)
+
+    def test_structural_mismatch_triggers_retry_even_without_recognized_family(self):
+        # "3 比特" stated but the circuit only declares 2 -- no GHZ/Bell/etc
+        # keyword present, so this only gets caught by the structural check.
+        wrong_count_reply = """[TASK: generate]
+[TARGET: other]
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[2];
+creg c[2];
+h q[0];
+measure q -> c;
+```
+"""
+        fixed_reply = """[TASK: generate]
+[TARGET: other]
+```
+OPENQASM 2.0;
+include "qelib1.inc";
+qreg q[3];
+creg c[3];
+h q[0];
+h q[1];
+h q[2];
+measure q -> c;
+```
+"""
+        SequencedAPIHandler.reply_sequence = [wrong_count_reply, fixed_reply]
+        reply = l2_agent.agent_chat("生成一个 3 比特电路，每个比特都做叠加")
+
+        self.assertEqual(SequencedAPIHandler.call_count, 2)
+        second_request_messages = SequencedAPIHandler.captured_payloads[1]["messages"]
+        self.assertIn("3 个比特", second_request_messages[3]["content"])
+        self.assertIn("2 个量子比特", second_request_messages[3]["content"])
 
 
 if __name__ == "__main__":

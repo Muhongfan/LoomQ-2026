@@ -9,12 +9,15 @@ try:
     from .emitters import EMITTERS
     from .lowering import lower
     from .validator import validate_circuit
+    from . import l2_agent
 except ImportError:
     import runner as _runner
     from circuit_ir import parse_qasm2
     from emitters import EMITTERS
     from lowering import lower
     from validator import validate_circuit
+    import l2_agent
+
 
 SUPPORTED_TARGETS = ("spinq", "originq", "braket")
 
@@ -42,7 +45,7 @@ def run(qasm_str: str, target: str, shots: int) -> Dict[str, Any]:
 
 def agent_chat(prompt: str) -> str:
     """Optional L2 entry point using the documented LOOMQ_LLM_* environment."""
-    raise NotImplementedError("L2 is optional; implement agent_chat(prompt) to enter")
+    return l2_agent.agent_chat(prompt)
 
 
 def compile_hybrid(hybrid_qasm_str: str) -> Tuple[List[str], str]:
