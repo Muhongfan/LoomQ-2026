@@ -13,3 +13,6 @@ spinqit==0.2.4
 antlr4-python3-runtime==4.9.2
 amazon-braket-sdk==1.99.0
 amazon-braket-default-simulator==1.27.0
+# Confirmed no dependency conflict with the antlr4 pin above (pyqpanda's
+# own dependency tree doesn't touch antlr4/spinqit/braket at all).
+pyqpanda==3.8.5
