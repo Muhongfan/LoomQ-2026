@@ -10,6 +10,7 @@ try:
     from .lowering import lower
     from .validator import validate_circuit
     from . import l2_agent
+    from . import hybrid_compiler
 except ImportError:
     import runner as _runner
     from circuit_ir import parse_qasm2
@@ -17,6 +18,7 @@ except ImportError:
     from lowering import lower
     from validator import validate_circuit
     import l2_agent
+    import hybrid_compiler
 
 
 SUPPORTED_TARGETS = ("spinq", "originq", "braket")
@@ -50,6 +52,4 @@ def agent_chat(prompt: str) -> str:
 
 def compile_hybrid(hybrid_qasm_str: str) -> Tuple[List[str], str]:
     """Optional L3 entry point. Return quantum operations and RISC-V assembly."""
-    raise NotImplementedError(
-        "L3 is optional; implement compile_hybrid(hybrid_qasm_str) to enter"
-    )
+    return hybrid_compiler.compile_hybrid(hybrid_qasm_str)
