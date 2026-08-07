@@ -9,3 +9,5 @@ __pycache__/
 .venv-clean-check/
 tools/
 ROADMAP.md
+spinq_private_key.pem
+.env

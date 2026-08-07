@@ -8,7 +8,7 @@
 
 把要申报项目的方框改成 `[x]`，并填写对应内容：
 
-- [ ] L1 真机
+- [x] L1 真机
 - [x] L2 交互体验
 - [x] 工程与产品化
 - [ ] 自定义量子 RISC-V Bonus
@@ -37,6 +37,31 @@ evidence/files/spinq-screenshot.png
 ```
 
 工作人员会核对 job ID、运行时间、电路、shots 和原始结果。截图只能辅助说明，不能代替 job ID 和原始结果。
+
+### 平台一：量旋 SpinQ Cloud
+
+```text
+平台名称：量旋 SpinQ Cloud —— gemini_vp（2 比特核磁真机）
+平台 job ID：G-260807-0003
+运行时间：2026-08-07T03:01:42Z
+shots：1000
+实际执行的 QASM：starter_kit/evidence/files/spinq-real-chip-bell.qasm
+平台返回的原始结果：starter_kit/evidence/files/spinq-real-chip-bell-result.json
+任务页截图：（未提供，可登录 SpinQ Cloud 控制台按 job ID 查询任务记录核实）
+```
+
+说明：SpinQ Cloud 的电路装配器不接受电路里显式的 `measure` 语句（会在末尾对所有比特自动测量），
+因此提交给云端的 QASM 文本比 `transpile()` 契约输出少了末尾的 `measure q -> c;` 行——这是
+SpinQ Cloud API 本身的要求，不影响 `starter_kit/target_ir_contract.md` 定义的 `transpile()`
+契约行为（该契约的完整输出仍包含 measure 语句，只用于本地 BasicSimulator 路径）。
+提交时 `superconductor_vp`（8 比特超导真机）恰好无在线机器，改用同样在线中的 2 比特核磁真机
+`gemini_vp`（比特数刚好够跑 Bell 态）。
+原始 `counts` 为 `{"00": 398, "11": 291, "10": 274, "01": 38}`：Bell 态理想主峰 `00`/`11`
+合计 689/1000（68.9%），是明显的主导态组合；`10` 偏高应为该 2 比特核磁真机自身的读出不对称
+噪声，原始数据未做任何修饰。
+
+对应实现：`starter_kit/runner.py::run_spinq_real_chip`（未注册进 `RUNNERS`／不参与 `run()`
+契约调用，仅用于本证据采集，与 `run_originq_real_chip` 同一模式）。
 
 ## L2 交互体验
 
