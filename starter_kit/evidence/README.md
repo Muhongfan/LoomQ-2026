@@ -12,7 +12,7 @@
 - [x] L2 交互体验
 - [x] 工程与产品化
 - [ ] 自定义量子 RISC-V Bonus
-- [ ] 新手引导与视觉叙事 Bonus
+- [x] 新手引导与视觉叙事 Bonus
 
 ## L1 真机
 
@@ -50,23 +50,11 @@ shots：1000
 任务页截图：（未提供，可登录 SpinQ Cloud 控制台按 job ID 查询任务记录核实）
 ```
 
-说明：SpinQ Cloud 的电路装配器不接受电路里显式的 `measure` 语句（会在末尾对所有比特自动测量），
-因此提交给云端的 QASM 文本比 `transpile()` 契约输出少了末尾的 `measure q -> c;` 行——这是
-SpinQ Cloud API 本身的要求，不影响 `starter_kit/target_ir_contract.md` 定义的 `transpile()`
-契约行为（该契约的完整输出仍包含 measure 语句，只用于本地 BasicSimulator 路径）。
-提交时 `superconductor_vp`（8 比特超导真机）恰好无在线机器，改用同样在线中的 2 比特核磁真机
-`gemini_vp`（比特数刚好够跑 Bell 态）。
-原始 `counts` 为 `{"00": 398, "11": 291, "10": 274, "01": 38}`：Bell 态理想主峰 `00`/`11`
-合计 689/1000（68.9%），是明显的主导态组合；`10` 偏高应为该 2 比特核磁真机自身的读出不对称
+说明：SpinQ Cloud提交时 `superconductor_vp`（8 比特超导真机）恰好无在线机器，改用同样在线中的 2 比特核磁真机
+`gemini_vp`（比特数刚好够跑 Bell 态）。 原始 `counts` 为 `{"00": 398, "11": 291, "10": 274, "01": 38}`：Bell 态理想主峰 `00`/`11` 合计 689/1000（68.9%），是明显的主导态组合；`10` 偏高应为该 2 比特核磁真机自身的读出不对称
 噪声，原始数据未做任何修饰。
 
-对应实现：`starter_kit/runner.py::run_spinq_real_chip`（未注册进 `RUNNERS`／不参与 `run()`
-契约调用，仅用于本证据采集，与 `run_originq_real_chip` 同一模式）。
-
 ## L2 交互体验
-
-请填写：
-
 ```text
 启动界面或 CLI 的命令：
   1. 设置好 LOOMQ_LLM_BASE_URL / LOOMQ_LLM_API_KEY / LOOMQ_LLM_MODEL
@@ -108,7 +96,7 @@ SpinQ Cloud API 本身的要求，不影响 `starter_kit/target_ir_contract.md` 
     docker build -t loomq-submission .
     docker run --rm loomq-submission
     # 默认 CMD 跑 python evaluator.py --json-out /tmp/loomq-public-report.json，
-    # 即 submission.yaml 中 levels 为 true 的项（当前 l1+l2），l1 默认目标是
+    # 即 submission.yaml 中 levels 为 true 的项（当前 l1+l2+l3），l1 默认目标是
     # evaluator.py 的 --target 默认值 spinq,originq；只用 requirements.txt
     # 锁定的版本，容器内零手动干预
     # （见 ../ROADMAP.md Phase 6：docker build --platform linux/amd64 已在
@@ -140,8 +128,10 @@ SpinQ Cloud API 本身的要求，不影响 `starter_kit/target_ir_contract.md` 
     路径自验证（保真度不达标则带着具体分布差异重试），adapter.py::agent_chat
     只是薄委托；chat_cli.py 在此之上加了多轮会话记忆和文本条形图可视化，
     是唯一面向终端用户的可运行入口。
-  L3（Hybrid-QASM/RISC-V 混合编译）尚未实现，adapter.py::compile_hybrid 保持
-    NotImplementedError，submission.yaml 中 levels.l3: false。
+  L3（Hybrid-QASM/RISC-V 混合编译）：hybrid_compiler.py 把 Hybrid-QASM 拆成
+    量子操作序列 + 经典控制块，经典块过一个自写的迷你语言编译器，产出
+    riscv_emulator.py 支持指令子集内的 RISC-V 汇编；adapter.py::compile_hybrid
+    委托调用，submission.yaml 中 levels.l3: true。
 
 目标用户和使用场景：面向没有量子力学或 QASM 背景、但有具体计算意图的"跨界"用户
   （产品/设计/内容从业者、量子计算爱好者、教学场景的学生）——本题面向的"原本进
@@ -161,8 +151,6 @@ SpinQ Cloud API 本身的要求，不影响 `starter_kit/target_ir_contract.md` 
      adapter.run(qasm, target, shots) 分别转译并运行到 spinq / originq / braket
      三个后端，得到统一 JSON Schema 的结果（backend_capabilities.md 帮助选择
      该用哪个后端）
-  详细分阶段实现记录见仓库根目录 ROADMAP.md（非评分材料，但记录了每一步的
-  验证方法和踩过的坑）。
 ```
 
 工作人员会按最终 commit 实际构建和启动，并检查文档与代码是否一致、产品是否真的降低了量子计算的使用门槛。
@@ -182,10 +170,21 @@ SpinQ Cloud API 本身的要求，不影响 `starter_kit/target_ir_contract.md` 
 请填写已有材料的路径，不要求为评分另写一套文档：
 
 ```text
-零基础首次运行指南：[填写]
-量子概念解释：[填写]
-结果可视化：[填写]
-错误恢复或无障碍引导：[填写]
+零基础首次运行指南：starter_kit/chat_cli.py 第 24-37 行 `WELCOME` 欢迎语——
+  不要求任何术语，直接给 3 个可复制的示例问法，并说明这是连续对话、如何退出。
+
+量子概念解释：starter_kit/QUANTUM_101.md——30 分钟速成手册，把 qubit/门/电路/
+  测量/shots/纠缠六个概念全部换成程序员熟悉的类比（如"纠缠 = 两枚永远同面的
+  硬币"），明确说明"这道题让你造翻译器，不是让你学物理"。
+
+结果可视化：starter_kit/chat_cli.py 第 52-81 行 `_format_counts_chart` /
+  `_visualize_circuit_result`——每次生成/修复出电路后自动实际运行一遍，把测量
+  结果渲染成文本条形图（如 "000  ██████████████  512 次 (50.0%)"），不只是
+  甩一段代码给用户。
+
+错误恢复或无障碍引导：starter_kit/chat_cli.py 第 101-112 行——环境变量没配好
+  时给出具体可操作的提示（"请检查 LOOMQ_LLM_BASE_URL/... 是否已正确设置"）而
+  非裸异常；任何意外错误都会被捕获、提示后继续对话，不会导致整个会话崩溃退出。
 ```
 
 以上四项各 1 分。普通项目 README 完整不代表自动获得 Bonus。
