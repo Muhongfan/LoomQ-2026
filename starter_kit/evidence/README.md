@@ -10,7 +10,7 @@
 
 - [ ] L1 真机
 - [x] L2 交互体验
-- [ ] 工程与产品化
+- [x] 工程与产品化
 - [ ] 自定义量子 RISC-V Bonus
 - [ ] 新手引导与视觉叙事 Bonus
 
@@ -77,10 +77,67 @@ evidence/files/spinq-screenshot.png
 已有内容可以直接引用主 README 或其他项目文档，不必复制到本目录。
 
 ```text
-干净环境中的构建和启动命令：[填写命令或文档路径]
-架构说明：[填写文档路径，或用几句话说明主要模块]
-目标用户和使用场景：[填写]
-完整使用流程：[填写文档、截图或演示路径]
+干净环境中的构建和启动命令：
+  方式一（Docker，推荐用于评委复现）：
+    cd starter_kit
+    docker build -t loomq-submission .
+    docker run --rm loomq-submission
+    # 默认 CMD 跑 python evaluator.py --json-out /tmp/loomq-public-report.json，
+    # 即 submission.yaml 中 levels 为 true 的项（当前 l1+l2），l1 默认目标是
+    # evaluator.py 的 --target 默认值 spinq,originq；只用 requirements.txt
+    # 锁定的版本，容器内零手动干预
+    # （见 ../ROADMAP.md Phase 6：docker build --platform linux/amd64 已在
+    # Linux 容器内验证过 L1 公开电路通过，且 spinqit 的 macOS-only rpath
+    # 问题确认不影响 Linux 容器；必须用 --platform linux/amd64，spinqit
+    # 没有 arm64 wheel）
+
+  方式二（本地 venv，用于开发/调试）：
+    python3 -m venv .venv && source .venv/bin/activate
+    pip install -r starter_kit/requirements.txt
+    set -a && source .env && set +a   # 加载 LOOMQ_LLM_* 三个环境变量（L2 用）
+    cd starter_kit
+    python3 evaluator.py --level l1 --target spinq,braket,originq   # L1 公开自测
+    python3 evaluator.py --level l2                                  # L2 公开自测
+    python3 chat_cli.py                                               # L2 零基础用户交互入口
+
+架构说明：单向流水线，`starter_kit/adapter.py` 是评测唯一入口，内部委托给以下模块
+（详见仓库根目录 README.md 的系统架构图，以及 ROADMAP.md 逐阶段记录）：
+  circuit_ir.py（QASM2 解析为内部 Circuit/GateOp 表示）
+    -> validator.py（12 门白名单 + arity + 越界/重复比特校验）
+    -> lowering.py（按 gate_identities.py 把目标后端不支持的门分解为等价序列；
+       当前 3 个后端原生支持全部 12 门，这一步是有文档说明的 no-op，作为兜底路径保留）
+    -> emitters.py（emit_spinq / emit_braket / emit_originq，按 target_ir_contract.md
+       生成三种目标格式的原生指令文本）
+    -> runner.py（run()：调用对应 SDK 真正执行，并把三个后端不一致的比特序约定
+       统一归一化为契约要求的 c[n-1]...c[0] 小端表示）
+  L2 是独立的一层，不改动 L1 的确定性流水线：l2_agent.py 用一个 system prompt
+    驱动 LLM 完成"生成 / 纠错 / 选后端"三类任务，生成结果会调用 L1 自己的执行
+    路径自验证（保真度不达标则带着具体分布差异重试），adapter.py::agent_chat
+    只是薄委托；chat_cli.py 在此之上加了多轮会话记忆和文本条形图可视化，
+    是唯一面向终端用户的可运行入口。
+  L3（Hybrid-QASM/RISC-V 混合编译）尚未实现，adapter.py::compile_hybrid 保持
+    NotImplementedError，submission.yaml 中 levels.l3: false。
+
+目标用户和使用场景：面向没有量子力学或 QASM 背景、但有具体计算意图的"跨界"用户
+  （产品/设计/内容从业者、量子计算爱好者、教学场景的学生）——本题面向的"原本进
+  不来的人"。典型场景：用户不知道"Bell 态""GHZ 态"这些术语，只会说"我想要 3
+  个粒子永远同时变化的效果"或"这段代码报错了帮我修好"，通过 chat_cli.py 的自然
+  语言对话就能拿到可在三家真实量子云平台（量旋 / 本源 / AWS Braket）上运行的
+  电路和结果，不需要先学会任何一家的专属 SDK 或指令集。
+
+完整使用流程：
+  1. 配置好 LOOMQ_LLM_* 三个环境变量（见 .env.example）
+  2. 运行 python3 starter_kit/chat_cli.py，用大白话描述想要的量子效果
+     （例："帮我做一个 4 个粒子永远同增同减的电路"）
+  3. Agent 识别意图、生成 OpenQASM 2.0 电路，自动用 L1 的执行路径实际跑一遍
+     自验证，展示测量结果的文本条形图；用户可直接追问修改（如"把粒子数改成
+     6 个"）而不用重复完整描述
+  4. 满意后同一份 QASM 可通过 adapter.transpile(qasm, target) /
+     adapter.run(qasm, target, shots) 分别转译并运行到 spinq / originq / braket
+     三个后端，得到统一 JSON Schema 的结果（backend_capabilities.md 帮助选择
+     该用哪个后端）
+  详细分阶段实现记录见仓库根目录 ROADMAP.md（非评分材料，但记录了每一步的
+  验证方法和踩过的坑）。
 ```
 
 工作人员会按最终 commit 实际构建和启动，并检查文档与代码是否一致、产品是否真的降低了量子计算的使用门槛。
